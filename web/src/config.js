@@ -1,5 +1,5 @@
-export const GITHUB_OWNER = 'zoumda28'
-export const GITHUB_REPO = 'Hands-On-Computer-Vision'
+export const GITHUB_OWNER = 'ZOUMDA28'
+export const GITHUB_REPO = '-CS231n-'
 export const GITHUB_BRANCH = 'main'
 
 export const GITHUB_REPO_URL = `https://github.com/${GITHUB_OWNER}/${GITHUB_REPO}`
