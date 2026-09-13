@@ -29,11 +29,7 @@ def normalize_source(source):
 def fix_source(source):
     # Fix typos
     source = source.replace('traject_ories', 'trajectories')
-    # Fix font to use available fonts
-    source = source.replace(
-        "matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']",
-        "matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans']"
-    )
+    # Notebook font settings are overridden by global config in execute_notebook()
     # Replace plt.show() with pass
     source = source.replace('plt.show()', 'pass')
     # Replace plt.savefig() calls - we capture figures directly as base64
@@ -66,8 +62,17 @@ def execute_notebook(path):
         'json': json,
     }
 
-    # Set matplotlib backend and font
-    matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    # Set matplotlib font with Chinese support
+    # Try multiple Chinese fonts in order of availability
+    from matplotlib import font_manager
+    cn_fonts = ['Microsoft YaHei', 'SimHei', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'Arial Unicode MS', 'DejaVu Sans']
+    available = [f.name for f in font_manager.fontManager.ttflist]
+    chosen = 'DejaVu Sans'
+    for f in cn_fonts:
+        if f in available:
+            chosen = f
+            break
+    matplotlib.rcParams['font.sans-serif'] = [chosen, 'DejaVu Sans']
     matplotlib.rcParams['axes.unicode_minus'] = False
 
     total_images = 0

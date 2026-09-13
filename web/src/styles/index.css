@@ -795,7 +795,11 @@
 }
 
 .rendered_html .katex {
-  font-size: 1.05em;
+  font-size: 1.15em;
+}
+
+.rendered_html .katex-display .katex {
+  font-size: 1.2em;
 }
 
 .math-display {
