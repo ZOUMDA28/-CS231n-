@@ -126,7 +126,7 @@ function notebookCatalogPlugin() {
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), notebookCatalogPlugin()],
-  base: './',
+  base: '/-CS231n-/',
   server: {
     host: '127.0.0.1',
     port: 5274,
