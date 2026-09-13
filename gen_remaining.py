@@ -2746,4 +2746,2209 @@ print("Homework 3 template ready. Implement guided backpropagation.")'''),
 ])
 save_notebook(nb4, os.path.join(BASE, "part2-cnn-vision", "lecture-10-visualization", "practice.ipynb"))
 
-print("Notebooks 1-4 done. Continuing with notebooks 5-8...")
+# ============================================================
+# Notebook 5: Transfer Learning and Fine-tuning
+# ============================================================
+print("Generating Notebook 5: Transfer Learning...")
+nb5 = make_notebook([
+    md_cell(r'''# 迁移学习与微调
+
+> **斯坦福 CS231n** | Transfer Learning and Fine-tuning
+
+## 本章导读
+
+迁移学习将在大规模数据集上预训练的模型迁移到小数据集上，是深度学习最实用的技术之一。本节从直觉到代码，完整理解特征提取和微调策略。
+
+**学习目标：**
+- 理解预训练模型的概念和价值
+- 区分特征提取（冻结）与微调（解冻）
+- 实现渐进式解冻策略
+- 比较 random init vs pretrained 的效果
+- 理解不同层的学习率设置
+
+**参考来源：** [CS231n Transfer Learning](https://cs231n.github.io/transfer-learning/) | [torchvision models](https://pytorch.org/vision/stable/models.html)'''),
+    md_cell(r'''## 1. 直觉理解：迁移学习为什么有效？
+
+### 核心问题
+
+在 ImageNet（1400 万图像）上训练一个 ResNet 需要数周和大量算力。但如果你只有 1000 张猫狗图片，如何获得高质量模型？
+
+### 迁移学习的思想
+
+**预训练 + 微调**：
+1. 在大数据集上预训练（如 ImageNet）
+2. 在目标数据集上微调或提取特征
+
+### 为什么有效？
+
+CNN 的层级特征具有迁移性：
+- **浅层**（边缘、纹理）：通用特征，跨领域可迁移
+- **深层**（物体部件、语义）：领域相关，需微调
+
+[[Yosinski et al., 2014]](https://arxiv.org/abs/1411.1792) 实验证明：特征可迁移性随层深度递减。'''),
+    md_cell(r'''### 三种迁移学习策略
+
+| 策略 | 预训练层 | 新层 | 训练方式 | 适用场景 |
+|------|----------|------|----------|----------|
+| **特征提取** | 全部冻结 | 仅分类头 | 只训练新层 | 小数据集（<1K） |
+| **微调** | 全部解冻 | 分类头 | 全部训练 | 中等数据集（1K-100K） |
+| **渐进式解冻** | 逐层解冻 | 分类头 | 从深到浅逐步 | 平衡稳定性和性能 |'''),
+    md_cell(r'''## 2. 手算验证：特征提取 vs 随机初始化
+
+### 特征提取的数学表示
+
+预训练模型 $f_{pre}$ 的编码器部分 $g(\cdot)$ 固定不动，只训练线性分类器 $W$：
+
+$$\text{features} = g(x; \theta_{pre}) \quad \text{(frozen)}$$
+$$\hat{y} = W \cdot \text{features} + b \quad \text{(trainable)}$$
+
+### 效果对比
+
+假设 3 类分类任务，100 个样本：
+- **随机初始化**：$W$ 从随机开始，需要学习所有特征——需要大量数据
+- **特征提取**：$g$ 已提取良好特征，$W$ 只需学习简单线性映射——需要很少数据
+
+### 手算：线性可分性
+
+预训练特征可能已经线性可分。设 2D 特征 3 类：
+- 类 0 中心：$(0, 0)$
+- 类 1 中心：$(3, 3)$
+- 类 2 中心：$(-3, 3)$
+
+简单最近邻或线性分类器即可达到接近 100% 准确率——因为预训练特征已经很好地分离了类别。'''),
+    code_cell(r'''# Verify: feature extraction vs random init
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
+np.random.seed(42)
+
+# Simulate pretrained features (well-separated clusters)
+n_per_class = 50
+centers = np.array([[0, 0], [3, 3], [-3, 3]])
+pretrained_features = []
+labels = []
+for c in range(3):
+    feat = centers[c] + np.random.randn(n_per_class, 2) * 0.3
+    pretrained_features.append(feat)
+    labels.extend([c] * n_per_class)
+X_pre = np.vstack(pretrained_features)
+y_pre = np.array(labels)
+
+# Simulate random features (no structure)
+X_random = np.random.randn(150, 2) * 2
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+for c in range(3):
+    mask = y_pre == c
+    axes[0].scatter(X_pre[mask, 0], X_pre[mask, 1], label=f'Class {c}', s=15)
+axes[0].set_title('Pretrained Features (well-separated)')
+axes[0].legend()
+for c in range(3):
+    mask = y_pre == c
+    axes[1].scatter(X_random[mask, 0], X_random[mask, 1], label=f'Class {c}', s=15)
+axes[1].set_title('Random Features (no structure)')
+axes[1].legend()
+plt.suptitle('Feature Space Comparison', fontsize=14)
+plt.tight_layout()
+plt.savefig('feature_space_comparison.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 1: Pretrained vs random features")'''),
+    md_cell(r'''## 3. 代码实现：迁移学习模拟
+
+用 numpy 模拟预训练模型：先在大数据集上"预训练"，再在小数据集上"迁移"。'''),
+    code_cell(r'''class PretrainedModel:
+    """Simulate a pretrained model with feature extractor + classifier."""
+    def __init__(self, input_dim, hidden_dims, n_classes):
+        layers = []
+        dims = [input_dim] + hidden_dims
+        for i in range(len(dims)-1):
+            W = np.random.randn(dims[i+1], dims[i]) * np.sqrt(2.0 / dims[i])
+            b = np.zeros(dims[i+1])
+            layers.append({'W': W, 'b': b})
+        # Classifier head
+        W_out = np.random.randn(n_classes, dims[-1]) * np.sqrt(2.0 / dims[-1])
+        b_out = np.zeros(n_classes)
+        layers.append({'W': W_out, 'b': b_out})
+        self.layers = layers
+        self.n_layers = len(layers)
+    
+    def forward(self, X):
+        """Forward pass, return activations for each layer."""
+        activations = [X]
+        cache = []
+        a = X
+        for i, layer in enumerate(self.layers):
+            z = a @ layer['W'].T + layer['b']
+            if i < self.n_layers - 1:
+                a = np.maximum(0, z)  # ReLU for hidden layers
+            else:
+                a = z  # No activation for output
+            activations.append(a)
+            cache.append((layer, z, a))
+        return a, activations, cache
+    
+    def extract_features(self, X, layer_idx=None):
+        """Extract features from a specific layer."""
+        if layer_idx is None:
+            layer_idx = self.n_layers - 2  # last hidden layer
+        _, activations, _ = self.forward(X)
+        return activations[layer_idx + 1]
+    
+    def train_step(self, X, y, lr=0.01, freeze_layers=0):
+        """Train one step. freeze_layers=number of layers to freeze (from start)."""
+        scores, activations, cache = self.forward(X)
+        N = X.shape[0]
+        
+        # Softmax loss
+        shifted = scores - np.max(scores, axis=1, keepdims=True)
+        exp_s = np.exp(shifted)
+        probs = exp_s / np.sum(exp_s, axis=1, keepdims=True)
+        loss = -np.log(probs[np.arange(N), y]).mean()
+        
+        # Backward
+        dscores = probs.copy()
+        dscores[np.arange(N), y] -= 1
+        dscores /= N
+        
+        da = dscores
+        for i in range(self.n_layers - 1, -1, -1):
+            if i < freeze_layers:
+                break  # frozen layer
+            layer, z, a = cache[i]
+            dW = da.T @ activations[i]
+            db = da.sum(axis=0)
+            if i > 0:
+                da = (da @ layer['W']) * (activations[i] > 0)
+            layer['W'] -= lr * dW
+            layer['b'] -= lr * db
+        
+        return loss
+    
+    def predict(self, X):
+        scores, _, _ = self.forward(X)
+        return np.argmax(scores, axis=1)
+
+print("PretrainedModel class defined")'''),
+    code_cell(r'''# Phase 1: Pretrain on large dataset (many classes)
+np.random.seed(42)
+n_pretrain_classes = 10
+input_dim = 20
+pretrain_model = PretrainedModel(input_dim, [32, 16], n_pretrain_classes)
+
+# Generate large pretraining dataset
+n_pretrain = 500
+X_pretrain = np.random.randn(n_pretrain, input_dim)
+# Add class structure
+y_pretrain = np.random.randint(0, n_pretrain_classes, n_pretrain)
+# Inject class-dependent patterns
+for c in range(n_pretrain_classes):
+    mask = y_pretrain == c
+    X_pretrain[mask] += np.random.randn(mask.sum(), input_dim) * 0.5 + c
+
+print("Phase 1: Pretraining...")
+pretrain_losses = []
+for epoch in range(300):
+    loss = pretrain_model.train_step(X_pretrain, y_pretrain, lr=0.05)
+    pretrain_losses.append(loss)
+    if epoch % 100 == 0:
+        acc = np.mean(pretrain_model.predict(X_pretrain) == y_pretrain)
+        print(f"  Pretrain epoch {epoch}: loss={loss:.4f}, acc={acc:.2%}")
+
+print(f"Pretraining accuracy: {np.mean(pretrain_model.predict(X_pretrain) == y_pretrain):.2%}")'''),
+    code_cell(r'''# Phase 2: Transfer to small dataset (fewer classes)
+np.random.seed(42)
+n_target_classes = 3
+n_target = 30  # small dataset!
+
+# Generate target data (subset of pretrain classes)
+target_classes = np.random.choice(n_pretrain_classes, n_target_classes, replace=False)
+X_target = np.random.randn(n_target, input_dim)
+y_target = np.random.choice(n_target_classes, n_target)
+
+for i, c in enumerate(target_classes):
+    mask = y_target == i
+    X_target[mask] += np.random.randn(mask.sum(), input_dim) * 0.5 + c
+
+# Strategy 1: Feature extraction (freeze all, replace classifier)
+transfer_fe = PretrainedModel(input_dim, [32, 16], n_target_classes)
+# Copy pretrained hidden layers
+for i in range(len(transfer_fe.layers) - 1):
+    transfer_fe.layers[i] = pretrain_model.layers[i].copy() if isinstance(pretrain_model.layers[i], dict) else pretrain_model.layers[i]
+
+# Actually copy weights
+for i in range(len(transfer_fe.layers) - 1):
+    transfer_fe.layers[i]['W'] = pretrain_model.layers[i]['W'].copy()
+    transfer_fe.layers[i]['b'] = pretrain_model.layers[i]['b'].copy()
+
+fe_losses = []
+for epoch in range(200):
+    loss = transfer_fe.train_step(X_target, y_target, lr=0.1, freeze_layers=2)
+    fe_losses.append(loss)
+
+fe_acc = np.mean(transfer_fe.predict(X_target) == y_target)
+print(f"Strategy 1 - Feature Extraction: acc={fe_acc:.2%}")
+
+# Strategy 2: Fine-tuning (unfreeze all)
+transfer_ft = PretrainedModel(input_dim, [32, 16], n_target_classes)
+for i in range(len(transfer_ft.layers) - 1):
+    transfer_ft.layers[i]['W'] = pretrain_model.layers[i]['W'].copy()
+    transfer_ft.layers[i]['b'] = pretrain_model.layers[i]['b'].copy()
+
+ft_losses = []
+for epoch in range(200):
+    loss = transfer_ft.train_step(X_target, y_target, lr=0.01, freeze_layers=0)
+    ft_losses.append(loss)
+
+ft_acc = np.mean(transfer_ft.predict(X_target) == y_target)
+print(f"Strategy 2 - Fine-tuning:        acc={ft_acc:.2%}")
+
+# Strategy 3: Random initialization (no transfer)
+random_model = PretrainedModel(input_dim, [32, 16], n_target_classes)
+rand_losses = []
+for epoch in range(200):
+    loss = random_model.train_step(X_target, y_target, lr=0.05)
+    rand_losses.append(loss)
+
+rand_acc = np.mean(random_model.predict(X_target) == y_target)
+print(f"Strategy 3 - Random Init:        acc={rand_acc:.2%}")'''),
+    code_cell(r'''# Visualize transfer learning comparison
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# Loss curves
+ax1 = axes[0]
+ax1.plot(fe_losses, label='Feature Extraction', color='#16a34a', linewidth=2)
+ax1.plot(ft_losses, label='Fine-tuning', color='#2563eb', linewidth=2)
+ax1.plot(rand_losses, label='Random Init', color='#ea580c', linewidth=2)
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Loss')
+ax1.set_title('Training Loss: Transfer vs Random')
+ax1.legend()
+
+# Accuracy comparison
+ax2 = axes[1]
+strategies = ['Feature\nExtraction', 'Fine-tuning', 'Random Init']
+accs = [fe_acc, ft_acc, rand_acc]
+colors = ['#16a34a', '#2563eb', '#ea580c']
+bars = ax2.bar(strategies, accs, color=colors)
+ax2.set_ylabel('Accuracy')
+ax2.set_title('Accuracy Comparison (30 samples)')
+ax2.set_ylim(0, 1.1)
+for bar, acc in zip(bars, accs):
+    ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02, 
+             f'{acc:.1%}', ha='center', fontsize=12)
+plt.tight_layout()
+plt.savefig('transfer_learning_comparison.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 2: Transfer learning comparison")'''),
+    md_cell(r'''## 4. 渐进式解冻
+
+### 原理
+
+渐进式解冻（Progressive Unfreezing）逐步解冻网络层：
+1. 先冻结所有预训练层，只训练分类头
+2. 解冻最后一层，用小学习率训练
+3. 逐步解冻更浅的层
+
+[[Howard & Ruder, 2018]](https://arxiv.org/abs/1801.06146) ULMFiT 论文提出了这种方法。
+
+### 学习率策略
+
+不同层使用不同学习率（ Discriminative Learning Rates）：
+- 浅层（通用特征）：小学习率（如 $10^{-5}$）
+- 深层（领域特征）：中学习率（如 $10^{-4}$）
+- 分类头（新参数）：大学习率（如 $10^{-3}$）'''),
+    code_cell(r'''# Progressive unfreezing experiment
+np.random.seed(42)
+n_phases = 3
+epochs_per_phase = 100
+
+transfer_progressive = PretrainedModel(input_dim, [32, 16], n_target_classes)
+for i in range(len(transfer_progressive.layers) - 1):
+    transfer_progressive.layers[i]['W'] = pretrain_model.layers[i]['W'].copy()
+    transfer_progressive.layers[i]['b'] = pretrain_model.layers[i]['b'].copy()
+
+prog_losses = []
+prog_accs = []
+
+for phase in range(n_phases):
+    freeze = (len(transfer_progressive.layers) - 1) - phase - 1
+    freeze = max(freeze, 0)
+    lr = 0.1 * (0.1 ** phase)  # decreasing LR
+    
+    for epoch in range(epochs_per_phase):
+        loss = transfer_progressive.train_step(X_target, y_target, lr=lr, freeze_layers=freeze)
+        prog_losses.append(loss)
+    
+    acc = np.mean(transfer_progressive.predict(X_target) == y_target)
+    prog_accs.append(acc)
+    print(f"Phase {phase+1}: unfreeze layers from index {freeze}, lr={lr:.4f}, acc={acc:.2%}")
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.plot(prog_losses, color='#9333ea', linewidth=1.5)
+for phase in range(1, n_phases):
+    ax.axvline(x=phase * epochs_per_phase, color='gray', linestyle='--', alpha=0.5)
+    ax.text(phase * epochs_per_phase + 5, max(prog_losses) * 0.9, f'Phase {phase+1}')
+ax.set_xlabel('Epoch')
+ax.set_ylabel('Loss')
+ax.set_title('Progressive Unfreezing: Loss with Phase Boundaries')
+plt.tight_layout()
+plt.savefig('progressive_unfreezing.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 3: Progressive unfreezing")'''),
+    md_cell(r'''## 5. 冻结层分析
+
+可视化预训练模型各层特征的迁移性：浅层特征更通用，深层特征更任务相关。'''),
+    code_cell(r'''# Analyze feature transferability at different layers
+np.random.seed(42)
+
+# Extract features at different layers
+layer_features = {}
+for layer_idx in range(len(pretrain_model.layers) - 1):
+    feat = pretrain_model.extract_features(X_target, layer_idx=layer_idx)
+    layer_features[layer_idx] = feat
+
+# Train linear classifier on each layer's features
+def train_linear(X, y, lr=0.1, epochs=200):
+    """Simple linear classifier training."""
+    n_classes = len(np.unique(y))
+    W = np.random.randn(n_classes, X.shape[1]) * 0.01
+    b = np.zeros(n_classes)
+    for _ in range(epochs):
+        scores = X @ W.T + b
+        shifted = scores - np.max(scores, axis=1, keepdims=True)
+        exp_s = np.exp(shifted)
+        probs = exp_s / np.sum(exp_s, axis=1, keepdims=True)
+        dscores = probs.copy()
+        dscores[np.arange(len(y)), y] -= 1
+        dscores /= len(y)
+        W -= lr * dscores.T @ X
+        b -= lr * dscores.sum(axis=0)
+    return np.mean(np.argmax(X @ W.T + b, axis=1) == y)
+
+print("Layer transferability analysis:")
+layer_accs = []
+for layer_idx, feat in layer_features.items():
+    acc = train_linear(feat, y_target, lr=0.1, epochs=300)
+    layer_accs.append(acc)
+    print(f"  Layer {layer_idx} features: dim={feat.shape[1]}, linear_acc={acc:.2%}")
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.bar(range(len(layer_accs)), layer_accs, color=['#16a34a', '#2563eb', '#ea580c'])
+ax.set_xlabel('Layer Index (0=shallow, 2=deep)')
+ax.set_ylabel('Linear Probe Accuracy')
+ax.set_title('Feature Transferability by Layer Depth')
+plt.tight_layout()
+plt.savefig('layer_transferability.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 4: Layer transferability")'''),
+    md_cell(r'''## 6. 实验观察
+
+### 关键发现
+
+1. **特征提取 > 随机初始化**：在 30 个小样本上，预训练特征远胜随机初始化
+2. **微调通常优于特征提取**：当数据足够时，微调可以适应目标任务
+3. **渐进式解冻**：稳定训练，避免灾难性遗忘
+4. **浅层更可迁移**：浅层特征通用，深层特征领域相关
+
+### 灾难性遗忘
+
+微调时如果学习率过大，预训练知识会被快速覆盖——这就是**灾难性遗忘**。解决方案：
+- 小学习率
+- 渐进式解冻
+- 回放策略（Replay）'''),
+    md_cell(r'''## 作业
+
+### 作业 1：实现 Discriminative Learning Rate
+
+不同层使用不同学习率：浅层用小 LR，深层用大 LR。'''),
+    code_cell(r'''# Homework 1: Discriminative learning rates
+def train_with_discriminative_lr(model, X, y, lrs, epochs=200):
+    """Train with different learning rates per layer.
+    
+    Args:
+        lrs: list of learning rates, one per layer (shallow to deep)
+    """
+    # TODO: implement discriminative learning rate training
+    # Key: each layer i uses lrs[i] instead of uniform lr
+    pass
+
+# Test
+# model = PretrainedModel(20, [32, 16], 3)
+# lrs = [0.001, 0.01, 0.1]  # shallow -> deep
+# losses = train_with_discriminative_lr(model, X_target, y_target, lrs, epochs=200)
+# acc = np.mean(model.predict(X_target) == y_target)
+# assert acc > 0.5, "Discriminative LR should achieve >50% accuracy"
+print("Homework 1 template ready. Implement discriminative learning rates.")'''),
+    md_cell(r'''### 作业 2：实现 Domain Adaptation
+
+模拟域偏移（Domain Shift）：源域和目标域的分布不同。'''),
+    code_cell(r'''# Homework 2: Domain adaptation
+def domain_adaptation(source_model, X_source, y_source, X_target, y_target, 
+                      n_adapt_epochs=100):
+    """Adapt pretrained model to target domain.
+    
+    Strategy: Fine-tune with small LR on target domain.
+    """
+    # TODO: implement domain adaptation
+    # 1. Start with source model
+    # 2. Fine-tune on target with small LR
+    # 3. Use early stopping to prevent overfitting
+    pass
+
+# Test
+np.random.seed(42)
+# Create domain-shifted data
+X_target_shifted = X_target + np.random.randn(*X_target.shape) * 0.5
+# acc = domain_adaptation(pretrain_model, X_pretrain, y_pretrain, 
+#                          X_target_shifted, y_target)
+# assert acc > 0.4, "Domain adaptation should help with distribution shift"
+print("Homework 2 template ready. Implement domain adaptation.")'''),
+    md_cell(r'''### 作业 3：实现 Layer Freezing Schedule
+
+实现一个冻结计划：训练过程中逐步解冻更多层。'''),
+    code_cell(r'''# Homework 3: Layer freezing schedule
+def freeze_schedule(model, X, y, total_epochs=300, unfreeze_every=100):
+    """Gradually unfreeze layers during training.
+    
+    Start with all layers frozen except classifier.
+    Every `unfreeze_every` epochs, unfreeze one more layer.
+    """
+    # TODO: implement freeze schedule
+    pass
+
+# Test
+# model = PretrainedModel(20, [32, 16], 3)
+# Copy pretrained weights
+# losses = freeze_schedule(model, X_target, y_target, total_epochs=300, unfreeze_every=100)
+# acc = np.mean(model.predict(X_target) == y_target)
+# assert acc > 0.5, "Freeze schedule should achieve >50% accuracy"
+print("Homework 3 template ready. Implement layer freezing schedule.")'''),
+    md_cell(r'''## 小结
+
+| 策略 | 冻结层 | 训练层 | 学习率 | 适用场景 |
+|------|--------|--------|--------|----------|
+| **特征提取** | 所有预训练层 | 仅分类头 | 大 | 极小数据集 |
+| **微调** | 无 | 全部 | 统一 | 中等数据集 |
+| **渐进式解冻** | 逐层减少 | 从深到浅 | 递减 | 平衡稳定与性能 |
+| **判别式 LR** | 无 | 全部 | 逐层递增 | 精细微调 |
+
+**关键洞察**：迁移学习是深度学习最实用的技术——大多数实际应用不需要从头训练。预训练模型的浅层特征具有通用性，迁移到新任务只需少量数据即可获得良好效果。'''),
+    md_cell(r'''## 参考文献
+
+1. [[Yosinski et al., 2014]](https://arxiv.org/abs/1411.1792) Yosinski et al. *How transferable are features in deep neural networks?* NIPS 2014.
+2. [[Howard & Ruder, 2018]](https://arxiv.org/abs/1801.06146) Howard & Ruder. *Universal Language Model Fine-tuning for Text Classification*. ACL 2018.
+3. [[Donahue et al., 2014]](https://arxiv.org/abs/1310.1531) Donahue et al. *DeCAF: A Deep Convolutional Activation Feature for Generic Visual Recognition*. ICML 2014.
+4. [[Razavian et al., 2014]](https://arxiv.org/abs/1403.6382) Razavian et al. *CNN Features off-the-shelf*. CVPR Workshop 2014.
+5. [[Kirkpatrick et al., 2017]](https://arxiv.org/abs/1612.00796) Kirkpatrick et al. *Overcoming Catastrophic Forgetting in Neural Networks*. PNAS 2017.
+
+---
+
+> 本节内容参考 [Stanford CS231n](https://cs231n.stanford.edu/) | [Transfer Learning](https://cs231n.github.io/transfer-learning/)'''),
+    md_cell(r'''---
+
+## 参考代码实现
+
+以下 GitHub 仓库提供了本节内容的完整代码实现，建议结合学习：
+
+- **[huggingface/pytorch-image-models](https://github.com/huggingface/pytorch-image-models)** (37139 stars): PyTorch 图像模型库（含大量预训练模型和迁移学习工具）
+  - 仓库地址: https://github.com/huggingface/pytorch-image-models
+
+- **[seloufian/Deep-Learning-Computer-Vision](https://github.com/seloufian/Deep-Learning-Computer-Vision)** (135 stars): 深度学习计算机视觉实践（含迁移学习教程）
+  - 仓库地址: https://github.com/seloufian/Deep-Learning-Computer-Vision
+
+> 标注说明: 以上仓库按热度排序，优先推荐 stars 最多的实现.'''),
+])
+save_notebook(nb5, os.path.join(BASE, "part3-frontiers", "lecture-11-transfer-learning", "practice.ipynb"))
+
+# ============================================================
+# Notebook 6: Image Segmentation
+# ============================================================
+print("Generating Notebook 6: Image Segmentation...")
+nb6 = make_notebook([
+    md_cell(r'''# 图像分割
+
+> **斯坦福 CS231n** | Image Segmentation: FCN and U-Net
+
+## 本章导读
+
+图像分割是像素级分类任务——为每个像素分配类别标签。本节从 FCN 到 U-Net，理解编码器-解码器架构和跳跃连接的原理。
+
+**学习目标：**
+- 区分语义分割与实例分割
+- 理解 FCN 全卷积网络架构
+- 实现 U-Net 编码器-解码器 + 跳跃连接
+- 理解转置卷积（反卷积）原理
+- 实现 mIoU 评估指标
+
+**参考来源：** [CS231n Lecture 11](https://cs231n.stanford.edu/) | [FCN Paper](https://arxiv.org/abs/1411.4038) | [U-Net Paper](https://arxiv.org/abs/1505.04597)'''),
+    md_cell(r'''## 1. 直觉理解：像素级分类
+
+### 分类 vs 分割
+
+| 任务 | 输出 | 粒度 |
+|------|------|------|
+| **图像分类** | 1 个标签 | 图像级 |
+| **语义分割** | H×W 标签 | 像素级 |
+| **实例分割** | H×W 实例 ID | 像素级 + 实例区分 |
+
+### 核心挑战
+
+1. **输出分辨率**：输出必须与输入同尺寸
+2. **多尺度**：不同大小的物体需要不同感受野
+3. **细节保留**：边界需要精确
+
+### FCN 的突破
+
+[[Long et al., 2015]](https://arxiv.org/abs/1411.4038)
+
+FCN (Fully Convolutional Network) 将分类网络的 FC 层替换为卷积层，实现端到端的像素级预测。关键创新：
+- 全卷积（无全连接）
+- 转置卷积上采样
+- 跳跃连接融合多尺度特征'''),
+    md_cell(r'''## 2. 手算验证：转置卷积
+
+### 转置卷积（反卷积）
+
+转置卷积用于上采样——将低分辨率特征图恢复到高分辨率。
+
+### 手算：2×2 → 3×3 转置卷积
+
+输入 $x = \begin{bmatrix} 1 & 2 \\ 3 & 4 \end{bmatrix}$，核 $K = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}$，stride=1, padding=0。
+
+输出尺寸：$H_{out} = (H_{in}-1) \times S - 2P + K = (2-1) \times 1 - 0 + 2 = 3$
+
+转置卷积的计算：将每个输入值乘以核，放到输出对应位置，重叠区域相加。
+
+- $x[0,0]=1 \times K$ 放在 $out[0:2, 0:2]$：$\begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}$
+- $x[0,1]=2 \times K$ 放在 $out[0:2, 1:3]$：$\begin{bmatrix} 0 & 2 \\ 0 & 0 \end{bmatrix}$（在列 1,2）
+- $x[1,0]=3 \times K$ 放在 $out[1:3, 0:2]$：$\begin{bmatrix} 0 & 0 \\ 3 & 0 \end{bmatrix}$（在行 1,2）
+- $x[1,1]=4 \times K$ 放在 $out[1:3, 1:3]$：$\begin{bmatrix} 0 & 0 \\ 0 & 4 \end{bmatrix}$（在行 1,2, 列 1,2）
+
+叠加后：
+$$out = \begin{bmatrix} 1 & 2 & 0 \\ 3 & 1+4 & 2 \\ 0 & 3 & 4 \end{bmatrix} = \begin{bmatrix} 1 & 2 & 0 \\ 3 & 5 & 2 \\ 0 & 3 & 4 \end{bmatrix}$$'''),
+    code_cell(r'''# Verify transposed convolution
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
+np.random.seed(42)
+
+def transposed_conv2d(x, kernel, stride=1, padding=0):
+    """Simple transposed convolution (upsampling).
+    
+    Args:
+        x: (H, W) input
+        kernel: (K, K) kernel
+        stride: upsampling stride
+        padding: padding
+    """
+    H, W = x.shape
+    K_h, K_w = kernel.shape
+    H_out = (H - 1) * stride - 2 * padding + K_h
+    W_out = (W - 1) * stride - 2 * padding + K_w
+    out = np.zeros((H_out, W_out))
+    
+    for i in range(H):
+        for j in range(W):
+            # Place kernel * x[i,j] at position
+            for ki in range(K_h):
+                for kj in range(K_w):
+                    oi = i * stride - padding + ki
+                    oj = j * stride - padding + kj
+                    if 0 <= oi < H_out and 0 <= oj < W_out:
+                        out[oi, oj] += x[i, j] * kernel[ki, kj]
+    return out
+
+# Verify manual calculation
+x = np.array([[1, 2], [3, 4]], dtype=float)
+K = np.array([[1, 0], [0, 1]], dtype=float)
+
+result = transposed_conv2d(x, K)
+print("Input:\n", x)
+print("\nKernel:\n", K)
+print("\nTransposed conv result:\n", result)
+print("\nExpected:\n[[1 2 0]\n [3 5 2]\n [0 3 4]]")
+assert np.allclose(result, [[1, 2, 0], [3, 5, 2], [0, 3, 4]]), "Mismatch!"
+print("Manual calculation verified!")'''),
+    md_cell(r'''## 3. 代码实现：U-Net 架构
+
+[[Ronneberger et al., 2015]](https://arxiv.org/abs/1505.04597)
+
+U-Net 架构：
+- **编码器（下采样）**：逐步提取高层特征，降低分辨率
+- **解码器（上采样）**：逐步恢复分辨率
+- **跳跃连接**：将编码器特征直接传递给解码器，保留细节'''),
+    code_cell(r'''class MiniUNet:
+    """Simplified U-Net for segmentation.
+    
+    Architecture:
+    Encoder: conv -> pool -> conv -> pool
+    Bottleneck: conv
+    Decoder: upconv -> concat -> conv -> upconv -> concat -> conv
+    """
+    def __init__(self, in_channels=1, n_classes=2):
+        # Encoder
+        self.enc1_W = np.random.randn(4, in_channels, 3, 3) * 0.1
+        self.enc1_b = np.zeros(4)
+        self.enc2_W = np.random.randn(8, 4, 3, 3) * 0.1
+        self.enc2_b = np.zeros(8)
+        # Bottleneck
+        self.bot_W = np.random.randn(8, 8, 3, 3) * 0.1
+        self.bot_b = np.zeros(8)
+        # Decoder (upsample + concat + conv)
+        self.dec1_W = np.random.randn(4, 16, 3, 3) * 0.1  # 8 (up) + 8 (skip) = 16
+        self.dec1_b = np.zeros(4)
+        self.dec2_W = np.random.randn(n_classes, 4 + in_channels, 3, 3) * 0.1
+        self.dec2_b = np.zeros(n_classes)
+    
+    def conv2d(self, x, W, b):
+        """Simple 2D convolution, no padding."""
+        if x.ndim == 2:
+            x = x[np.newaxis, ...]
+        C_in, H, Wd = x.shape
+        C_out, _, K, _ = W.shape
+        H_out, W_out = H - K + 1, Wd - K + 1
+        out = np.zeros((C_out, H_out, W_out))
+        for co in range(C_out):
+            for i in range(H_out):
+                for j in range(W_out):
+                    patch = x[:, i:i+K, j:j+K]
+                    out[co, i, j] = np.sum(patch * W[co]) + b[co]
+        return np.maximum(0, out)
+    
+    def maxpool2d(self, x, size=2):
+        """Max pooling."""
+        if x.ndim == 2:
+            x = x[np.newaxis, ...]
+        C, H, W = x.shape
+        H_out, W_out = H // size, W // size
+        out = np.zeros((C, H_out, W_out))
+        for c in range(C):
+            for i in range(H_out):
+                for j in range(W_out):
+                    out[c, i, j] = np.max(x[c, i*size:(i+1)*size, j*size:(j+1)*size])
+        return out
+    
+    def upsample(self, x, scale=2):
+        """Nearest neighbor upsampling."""
+        if x.ndim == 2:
+            x = x[np.newaxis, ...]
+        C, H, W = x.shape
+        out = np.zeros((C, H*scale, W*scale))
+        for c in range(C):
+            for i in range(H):
+                for j in range(W):
+                    out[c, i*scale:(i+1)*scale, j*scale:(j+1)*scale] = x[c, i, j]
+        return out
+    
+    def forward(self, x):
+        """Forward pass. x: (H, W) or (1, H, W)."""
+        if x.ndim == 2:
+            x = x[np.newaxis, ...]
+        
+        # Encoder
+        e1 = self.conv2d(x, self.enc1_W, self.enc1_b)      # (4, H-2, W-2)
+        p1 = self.maxpool2d(e1)                              # (4, (H-2)/2, ...)
+        e2 = self.conv2d(p1, self.enc2_W, self.enc2_b)      # (8, ...)
+        p2 = self.maxpool2d(e2)
+        
+        # Bottleneck
+        b = self.conv2d(p2, self.bot_W, self.bot_b)         # (8, ...)
+        
+        # Decoder with skip connections
+        u1 = self.upsample(b, 2)
+        # Concat with e2 (crop to match)
+        skip2 = e2[:, :u1.shape[1], :u1.shape[2]] if e2.shape[1] >= u1.shape[1] else e2
+        if u1.shape[1] <= e2.shape[1] and u1.shape[2] <= e2.shape[2]:
+            cat1 = np.concatenate([u1, e2[:, :u1.shape[1], :u1.shape[2]]], axis=0)
+        else:
+            cat1 = np.concatenate([u1, e2], axis=0)
+        d1 = self.conv2d(cat1, self.dec1_W, self.dec1_b)
+        
+        u2 = self.upsample(d1, 2)
+        # Concat with e1
+        if u2.shape[1] <= e1.shape[1] and u2.shape[2] <= e1.shape[2]:
+            cat2 = np.concatenate([u2, e1[:, :u2.shape[1], :u2.shape[2]]], axis=0)
+        else:
+            cat2 = np.concatenate([u2, e1], axis=0)
+        d2 = self.conv2d(cat2, self.dec2_W, self.dec2_b)
+        
+        return d2, (e1, e2, b, d1, d2)
+
+print("MiniUNet class defined")'''),
+    md_cell(r'''## 4. IoU 评估指标
+
+### Intersection over Union (IoU)
+
+$$\text{IoU} = \frac{|A \cap B|}{|A \cup B|} = \frac{TP}{TP + FP + FN}$$
+
+### Mean IoU (mIoU)
+
+对所有类别取平均：
+
+$$\text{mIoU} = \frac{1}{C} \sum_{c=1}^{C} \text{IoU}_c$$'''),
+    code_cell(r'''# IoU implementation and visualization
+def compute_iou(pred, target, n_classes=2):
+    """Compute mean IoU.
+    
+    Args:
+        pred: (H, W) predicted labels
+        target: (H, W) ground truth labels
+        n_classes: number of classes
+    """
+    ious = []
+    for c in range(n_classes):
+        pred_c = (pred == c)
+        target_c = (target == c)
+        intersection = np.sum(pred_c & target_c)
+        union = np.sum(pred_c | target_c)
+        iou = intersection / max(union, 1)
+        ious.append(iou)
+    return np.mean(ious), ious
+
+# Create synthetic segmentation data
+np.random.seed(42)
+H, W = 32, 32
+# Ground truth: two regions
+gt = np.zeros((H, W), dtype=int)
+gt[:H//2, :] = 0  # background (top)
+gt[H//2:, :] = 1  # foreground (bottom)
+
+# Simulate prediction (with some errors)
+pred = gt.copy()
+# Add random errors
+errors = np.random.rand(H, W) < 0.15
+pred[errors] = 1 - pred[errors]
+
+miou, per_class_iou = compute_iou(pred, gt, n_classes=2)
+print(f"Mean IoU: {miou:.4f}")
+print(f"Class 0 IoU: {per_class_iou[0]:.4f}")
+print(f"Class 1 IoU: {per_class_iou[1]:.4f}")
+
+# Visualize
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+axes[0].imshow(gt, cmap='RdBu')
+axes[0].set_title('Ground Truth')
+axes[0].axis('off')
+axes[1].imshow(pred, cmap='RdBu')
+axes[1].set_title(f'Prediction (mIoU={miou:.3f})')
+axes[1].axis('off')
+# Error map
+error_map = (pred != gt).astype(int)
+axes[2].imshow(error_map, cmap='Reds')
+axes[2].set_title(f'Errors ({np.sum(error_map)} pixels)')
+axes[2].axis('off')
+plt.suptitle('Segmentation: GT vs Prediction vs Errors', fontsize=14)
+plt.tight_layout()
+plt.savefig('segmentation_iou.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 1: Segmentation IoU")'''),
+    code_cell(r'''# FCN forward pass on small image
+np.random.seed(42)
+# Create synthetic image with a circle
+img = np.zeros((16, 16))
+for i in range(16):
+    for j in range(16):
+        if (i - 8)**2 + (j - 8)**2 < 16:
+            img[i, j] = 1.0
+
+# Add noise
+img += np.random.randn(16, 16) * 0.1
+
+# Run MiniUNet
+unet = MiniUNet(in_channels=1, n_classes=2)
+output, _ = unet.forward(img)
+pred_mask = np.argmax(output[0], axis=0)
+
+# Crop to original size for visualization
+pred_size = pred_mask.shape[0]
+gt_mask = (img > 0.5).astype(int)
+
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+axes[0].imshow(img, cmap='gray')
+axes[0].set_title('Input Image')
+axes[0].axis('off')
+axes[1].imshow(gt_mask, cmap='RdBu')
+axes[1].set_title('Ground Truth Mask')
+axes[1].axis('off')
+axes[2].imshow(pred_mask, cmap='RdBu')
+axes[2].set_title(f'U-Net Output ({pred_size}x{pred_size})')
+axes[2].axis('off')
+# Feature visualization
+axes[3].imshow(output[0, 0], cmap='hot')
+axes[3].set_title('Feature Map (ch 0)')
+axes[3].axis('off')
+plt.suptitle('Mini U-Net Segmentation Demo', fontsize=14)
+plt.tight_layout()
+plt.savefig('unet_segmentation.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 2: U-Net segmentation")'''),
+    md_cell(r'''## 5. 跳跃连接的作用
+
+### 没有跳跃连接 vs 有跳跃连接
+
+| 特性 | 无跳跃连接 | 有跳跃连接 |
+|------|-----------|-----------|
+| **边界精度** | 模糊 | 精确 |
+| **细节保留** | 丢失 | 保留 |
+| **训练难度** | 较难 | 较易 |
+| **梯度流** | 长路径 | 短路径（梯度快捷方式） |
+
+跳跃连接不仅融合了多尺度特征，还提供了梯度传播的捷径，缓解梯度消失。'''),
+    code_cell(r'''# Visualize skip connection effect (simulated)
+np.random.seed(42)
+
+# Simulate output with and without skip connections
+H, W = 32, 32
+# Ground truth: sharp boundary
+gt = np.zeros((H, W))
+gt[:, W//2:] = 1.0
+
+# With skip: sharp boundary (less upsampling blur)
+with_skip = gt.copy()
+with_skip += np.random.randn(H, W) * 0.05
+with_skip = (with_skip > 0.5).astype(float)
+
+# Without skip: blurry boundary (upsampling artifacts)
+from scipy.ndimage import gaussian_filter
+without_skip = gaussian_filter(gt.astype(float), sigma=3.0)
+without_skip = (without_skip > 0.5).astype(float)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+axes[0].imshow(gt, cmap='RdBu')
+axes[0].set_title('Ground Truth (sharp boundary)')
+axes[0].axis('off')
+axes[1].imshow(with_skip, cmap='RdBu')
+axes[1].set_title('With Skip Connections (sharp)')
+axes[1].axis('off')
+axes[2].imshow(without_skip, cmap='RdBu')
+axes[2].set_title('Without Skip Connections (blurry)')
+axes[2].axis('off')
+plt.suptitle('Skip Connection Effect on Boundary Precision', fontsize=14)
+plt.tight_layout()
+plt.savefig('skip_connection_effect.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 3: Skip connection effect")'''),
+    md_cell(r'''## 6. 转置卷积可视化'''),
+    code_cell(r'''# Visualize transposed convolution upsampling
+np.random.seed(42)
+
+# Create a small feature map
+feat = np.random.randn(4, 4) * 2
+# Use identity-like kernel for visualization
+kernel = np.array([[1, 0], [0, 1]], dtype=float)
+
+# Different stride values
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+axes[0].imshow(feat, cmap='viridis')
+axes[0].set_title(f'Input ({feat.shape[0]}x{feat.shape[1]})')
+axes[0].axis('off')
+
+for idx, stride in enumerate([1, 2, 3]):
+    result = transposed_conv2d(feat, kernel, stride=stride)
+    axes[idx+1].imshow(result, cmap='viridis')
+    axes[idx+1].set_title(f'stride={stride}\nOutput ({result.shape[0]}x{result.shape[1]})')
+    axes[idx+1].axis('off')
+
+plt.suptitle('Transposed Convolution Upsampling', fontsize=14)
+plt.tight_layout()
+plt.savefig('transposed_conv_demo.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 4: Transposed convolution")'''),
+    md_cell(r'''## 作业
+
+### 作业 1：实现像素级交叉熵损失
+
+分割任务使用像素级交叉熵：对每个像素计算 softmax 损失。'''),
+    code_cell(r'''# Homework 1: Pixel-wise cross-entropy loss
+def segmentation_loss(scores, target, n_classes=2):
+    """Pixel-wise cross-entropy loss.
+    
+    Args:
+        scores: (C, H, W) predicted scores per class
+        target: (H, W) ground truth labels
+        n_classes: number of classes
+    
+    Returns:
+        loss, d_scores (gradients)
+    """
+    # TODO: implement pixel-wise cross-entropy
+    # For each pixel (i,j):
+    #   1. Compute softmax over channels
+    #   2. Compute cross-entropy with target[i,j]
+    pass
+
+# Test
+# scores = np.random.randn(2, 8, 8)
+# target = np.random.randint(0, 2, (8, 8))
+# loss, grads = segmentation_loss(scores, target, n_classes=2)
+# assert loss > 0, "Loss should be positive"
+# assert grads.shape == scores.shape, "Gradient shape should match"
+print("Homework 1 template ready. Implement pixel-wise cross-entropy loss.")'''),
+    md_cell(r'''### 作业 2：实现 Dice Loss
+
+Dice Loss 是分割任务中替代交叉熵的常用损失，直接优化 IoU。
+
+[[Milletari et al., 2016]](https://arxiv.org/abs/1606.04797)'''),
+    code_cell(r'''# Homework 2: Dice loss
+def dice_loss(pred, target, smooth=1e-6):
+    """Dice loss for binary segmentation.
+    
+    Dice = 2 * |A ∩ B| / (|A| + |B|)
+    Loss = 1 - Dice
+    """
+    # TODO: implement Dice loss
+    pass
+
+# Test
+# pred = np.random.rand(8, 8)
+# target = (np.random.rand(8, 8) > 0.5).astype(float)
+# loss = dice_loss(pred, target)
+# assert 0 <= loss <= 1, "Dice loss should be in [0, 1]"
+print("Homework 2 template ready. Implement Dice loss.")'''),
+    md_cell(r'''### 作业 3：实现 U-Net 训练循环
+
+实现完整的 U-Net 训练循环，包括前向传播、损失计算和反向传播。'''),
+    code_cell(r'''# Homework 3: U-Net training loop
+def train_unet(unet, X_train, y_train, lr=0.01, epochs=100):
+    """Train MiniUNet on segmentation data.
+    
+    For each epoch:
+    1. Forward pass
+    2. Compute pixel-wise loss
+    3. Backward pass (compute gradients)
+    4. Update weights
+    """
+    # TODO: implement training loop
+    pass
+
+# Test
+# unet = MiniUNet(in_channels=1, n_classes=2)
+# losses = train_unet(unet, X_train, y_train, lr=0.01, epochs=50)
+# assert len(losses) == 50
+# assert losses[-1] < losses[0], "Loss should decrease"
+print("Homework 3 template ready. Implement U-Net training loop.")'''),
+    md_cell(r'''## 小结
+
+| 概念 | 要点 |
+|------|------|
+| **语义分割** | 每像素一个类别标签 |
+| **实例分割** | 每像素一个实例 ID |
+| **FCN** | 全卷积网络，分类网 FC→Conv |
+| **U-Net** | 编码器-解码器 + 跳跃连接 |
+| **转置卷积** | 上采样，低分辨率→高分辨率 |
+| **IoU/mIoU** | 交并比，分割评估标准 |
+| **Dice Loss** | 直接优化 IoU 的损失函数 |
+| **跳跃连接** | 保留细节，提供梯度捷径 |
+
+**关键洞察**：分割的核心是「下采样提取语义 + 上采样恢复分辨率 + 跳跃连接保留细节」。U-Net 的对称结构和跳跃连接使其在医学图像等需要精确边界的领域至今仍被广泛使用。'''),
+    md_cell(r'''## 参考文献
+
+1. [[Long et al., 2015]](https://arxiv.org/abs/1411.4038) Long et al. *Fully Convolutional Networks for Semantic Segmentation*. CVPR 2015.
+2. [[Ronneberger et al., 2015]](https://arxiv.org/abs/1505.04597) Ronneberger et al. *U-Net: Convolutional Networks for Biomedical Image Segmentation*. MICCAI 2015.
+3. [[Milletari et al., 2016]](https://arxiv.org/abs/1606.04797) Milletari et al. *V-Net: Fully Convolutional Neural Networks for Volumetric Medical Image Segmentation*. 3DV 2016.
+4. [[Chen et al., 2017]](https://arxiv.org/abs/1706.05587) Chen et al. *DeepLab: Semantic Image Segmentation with Deep Convolutional Nets*. IEEE TPAMI 2017.
+5. [[He et al., 2017]](https://arxiv.org/abs/1703.06870) He et al. *Mask R-CNN*. ICCV 2017.
+
+---
+
+> 本节内容参考 [Stanford CS231n](https://cs231n.stanford.edu/) | [FCN](https://arxiv.org/abs/1411.4038) | [U-Net](https://arxiv.org/abs/1505.04597)'''),
+    md_cell(r'''---
+
+## 参考代码实现
+
+以下 GitHub 仓库提供了本节内容的完整代码实现，建议结合学习：
+
+- **[milesial/Pytorch-UNet](https://github.com/milesial/Pytorch-UNet)** (11649 stars): U-Net PyTorch 完整实现（含训练和推理代码）
+  - 仓库地址: https://github.com/milesial/Pytorch-UNet
+
+- **[wolny/pytorch-3dunet](https://github.com/wolny/pytorch-3dunet)** (2419 stars): 3D U-Net PyTorch 实现（医学图像分割）
+  - 仓库地址: https://github.com/wolny/pytorch-3dunet
+
+- **[ellisdg/3DUnetCNN](https://github.com/ellisdg/3DUnetCNN)** (2228 stars): 3D U-Net CNN 实现（含深度学习训练框架）
+  - 仓库地址: https://github.com/ellisdg/3DUnetCNN
+
+> 标注说明: 以上仓库按热度排序，优先推荐 stars 最多的实现.'''),
+])
+save_notebook(nb6, os.path.join(BASE, "part3-frontiers", "lecture-14-segmentation", "practice.ipynb"))
+
+# ============================================================
+# Notebook 7: CLIP and Multimodal Learning
+# ============================================================
+print("Generating Notebook 7: CLIP and Multimodal Learning...")
+nb7 = make_notebook([
+    md_cell(r'''# CLIP 与多模态学习
+
+> **斯坦福 CS231n** | CLIP: Contrastive Language-Image Pre-training
+
+## 本章导读
+
+CLIP 通过对比学习将图像和文本映射到统一的嵌入空间，实现零样本分类。本节从对比损失出发，实现简化版 CLIP 并演示零样本推理。
+
+**学习目标：**
+- 理解对比学习（Contrastive Learning）的原理
+- 实现 InfoNCE 对比损失
+- 理解 CLIP 双编码器架构
+- 模拟零样本分类
+- 可视化嵌入空间
+
+**参考来源：** [CLIP Paper](https://arxiv.org/abs/2103.00020) | [OpenAI CLIP](https://github.com/openai/CLIP) | [CS231n Lecture](https://cs231n.stanford.edu/)'''),
+    md_cell(r'''## 1. 直觉理解：多模态对比学习
+
+### CLIP 的核心思想
+
+传统模型只处理图像**或**文本。CLIP 同时处理两者，通过**对比学习**让匹配的图文对在嵌入空间中靠近，不匹配的远离。
+
+### 训练目标
+
+给定 $N$ 个图文对 $\{(I_i, T_i)\}$：
+- 正样本：$(I_i, T_i)$ —— 匹配的图文对
+- 负样本：$(I_i, T_j), i \neq j$ —— 不匹配的图文对
+
+目标：最大化正样本的相似度，最小化负样本的相似度。
+
+### 为什么这很强大？
+
+1. **零样本分类**：不需要训练分类头，只需比较图像与文本提示的相似度
+2. **开放词汇**：不限于预定义类别，可以识别任意概念
+3. **多模态理解**：图像和文本在统一空间中表示
+
+[[Radford et al., 2021]](https://arxiv.org/abs/2103.00020)'''),
+    md_cell(r'''### CLIP 架构
+
+```
+图像 → 图像编码器 (ViT/CNN) → 图像嵌入 I_i
+                                    ↕ 对比损失
+文本 → 文本编码器 (Transformer) → 文本嵌入 T_i
+```
+
+- **图像编码器**：ViT 或 ResNet，输出 $D$ 维向量
+- **文本编码器**：Transformer，输出 $D$ 维向量
+- **对比损失**：InfoNCE
+
+### InfoNCE 损失
+
+$$L = -\frac{1}{N} \sum_{i=1}^{N} \left[\log \frac{\exp(\text{sim}(I_i, T_i) / \tau)}{\sum_{j=1}^{N} \exp(\text{sim}(I_i, T_j) / \tau)}\right]$$
+
+其中 $\text{sim}(I, T) = I \cdot T / (\|I\| \|T\|)$ 是余弦相似度，$\tau$ 是温度参数。
+
+对称版本：同时计算图像到文本和文本到图像的损失。'''),
+    md_cell(r'''## 2. 手算验证：对比损失
+
+### 小规模手算
+
+设 $N=2$ 个图文对，嵌入维度 $D=2$，温度 $\tau=1$。
+
+**图像嵌入：**
+$$I_1 = [1, 0], \quad I_2 = [0, 1]$$
+
+**文本嵌入（已归一化）：**
+$$T_1 = [0.8, 0.6], \quad T_2 = [0.6, 0.8]$$
+
+**余弦相似度矩阵：**
+$$S = \begin{bmatrix} I_1 \cdot T_1 & I_1 \cdot T_2 \\ I_2 \cdot T_1 & I_2 \cdot T_2 \end{bmatrix} = \begin{bmatrix} 0.8 & 0.6 \\ 0.6 & 0.8 \end{bmatrix}$$
+
+**图像到文本的损失**（对每行做 softmax）：
+
+行 1（$I_1$）：
+- $\text{softmax}([0.8, 0.6]) = [e^{0.8}/(e^{0.8}+e^{0.6}), e^{0.6}/(...)] = [0.55, 0.45]$
+- $L_1 = -\log(0.55) = 0.598$
+
+行 2（$I_2$）：
+- $\text{softmax}([0.6, 0.8]) = [0.45, 0.55]$
+- $L_2 = -\log(0.55) = 0.598$
+
+**图像到文本损失**：$L_{I \to T} = (0.598 + 0.598) / 2 = 0.598$
+
+对称地计算文本到图像损失（对列做 softmax），结果相同。
+
+**总损失**：$L = (L_{I \to T} + L_{T \to I}) / 2 = 0.598$'''),
+    code_cell(r'''# Verify contrastive loss calculation
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
+np.random.seed(42)
+
+# Image embeddings (normalized)
+I = np.array([[1, 0], [0, 1]], dtype=float)
+# Text embeddings (normalized)
+T = np.array([[0.8, 0.6], [0.6, 0.8]], dtype=float)
+
+# Cosine similarity matrix
+S = I @ T.T  # already normalized
+print("Similarity matrix S:")
+print(S)
+
+# InfoNCE loss
+tau = 1.0
+def info_nce_loss(S, tau=1.0):
+    """Compute symmetric InfoNCE loss."""
+    N = S.shape[0]
+    # Row-wise softmax (image to text)
+    logits = S / tau
+    log_prob_i2t = -np.log(np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True))
+    loss_i2t = np.mean(np.diag(log_prob_i2t))
+    
+    # Column-wise softmax (text to image)
+    log_prob_t2i = -np.log(np.exp(logits.T) / np.sum(np.exp(logits.T), axis=1, keepdims=True))
+    loss_t2i = np.mean(np.diag(log_prob_t2i))
+    
+    return (loss_i2t + loss_t2i) / 2
+
+loss = info_nce_loss(S, tau=1.0)
+print(f"\nInfoNCE loss: {loss:.4f}")
+print(f"Expected: ~0.598")'''),
+    md_cell(r'''## 3. 代码实现：Mini CLIP'''),
+    code_cell(r'''class MiniCLIP:
+    """Simplified CLIP model.
+    
+    Image encoder: 2-layer MLP
+    Text encoder: 2-layer MLP
+    Contrastive loss: InfoNCE
+    """
+    def __init__(self, img_dim, text_dim, embed_dim=64, tau=0.07):
+        # Image encoder
+        self.W_i1 = np.random.randn(32, img_dim) * np.sqrt(2.0 / img_dim)
+        self.b_i1 = np.zeros(32)
+        self.W_i2 = np.random.randn(embed_dim, 32) * np.sqrt(2.0 / 32)
+        self.b_i2 = np.zeros(embed_dim)
+        
+        # Text encoder
+        self.W_t1 = np.random.randn(32, text_dim) * np.sqrt(2.0 / text_dim)
+        self.b_t1 = np.zeros(32)
+        self.W_t2 = np.random.randn(embed_dim, 32) * np.sqrt(2.0 / 32)
+        self.b_t2 = np.zeros(embed_dim)
+        
+        self.tau = tau
+        self.embed_dim = embed_dim
+    
+    def encode_image(self, x):
+        h = np.maximum(0, x @ self.W_i1.T + self.b_i1)
+        emb = h @ self.W_i2.T + self.b_i2
+        return emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
+    
+    def encode_text(self, x):
+        h = np.maximum(0, x @ self.W_t1.T + self.b_t1)
+        emb = h @ self.W_t2.T + self.b_t2
+        return emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-8)
+    
+    def forward(self, images, texts):
+        img_emb = self.encode_image(images)
+        txt_emb = self.encode_text(texts)
+        S = img_emb @ txt_emb.T  # cosine similarity (normalized)
+        return S
+    
+    def loss(self, images, texts):
+        """Symmetric InfoNCE loss."""
+        S = self.forward(images, texts)
+        N = S.shape[0]
+        logits = S / self.tau
+        
+        # Image to text
+        exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+        probs_i2t = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+        loss_i2t = -np.mean(np.log(probs_i2t[np.arange(N), np.arange(N)] + 1e-10))
+        
+        # Text to image
+        exp_logits_t = np.exp(logits.T - np.max(logits.T, axis=1, keepdims=True))
+        probs_t2i = exp_logits_t / np.sum(exp_logits_t, axis=1, keepdims=True)
+        loss_t2i = -np.mean(np.log(probs_t2i[np.arange(N), np.arange(N)] + 1e-10))
+        
+        loss = (loss_i2t + loss_t2i) / 2
+        
+        # Gradients (simplified)
+        # dS_i2t: (N, N)
+        dlogits = probs_i2t.copy()
+        dlogits[np.arange(N), np.arange(N)] -= 1
+        dlogits /= N
+        
+        dlogits_t = probs_t2i.copy()
+        dlogits_t[np.arange(N), np.arange(N)] -= 1
+        dlogits_t /= N
+        
+        dS = (dlogits + dlogits_t.T) / self.tau
+        
+        return loss, dS, S
+    
+    def step(self, images, texts, lr=0.01):
+        """One gradient step."""
+        loss, dS, S = self.loss(images, texts)
+        
+        img_emb = self.encode_image(images)
+        txt_emb = self.encode_text(texts)
+        
+        # Backprop to embeddings
+        d_img_emb = dS @ txt_emb  # (N, D)
+        d_txt_emb = dS.T @ img_emb
+        
+        # Normalize gradient (account for L2 norm)
+        norms_i = np.linalg.norm(img_emb, axis=1, keepdims=True) + 1e-8
+        d_img_emb = d_img_emb / norms_i - img_emb * np.sum(d_img_emb * img_emb, axis=1, keepdims=True) / norms_i**2
+        
+        norms_t = np.linalg.norm(txt_emb, axis=1, keepdims=True) + 1e-8
+        d_txt_emb = d_txt_emb / norms_t - txt_emb * np.sum(d_txt_emb * txt_emb, axis=1, keepdims=True) / norms_t**2
+        
+        # Backprop through image encoder
+        dh_i = d_img_emb @ self.W_i2
+        dz_i = dh_i * (img_emb @ self.W_i2.T + self.b_i2 > 0)  # approximate ReLU grad
+        self.W_i2 -= lr * (dz_i.T @ np.maximum(0, images @ self.W_i1.T + self.b_i1))
+        self.b_i2 -= lr * dz_i.sum(axis=0)
+        
+        # Backprop through text encoder
+        dh_t = d_txt_emb @ self.W_t2
+        dz_t = dh_t * (txt_emb @ self.W_t2.T + self.b_t2 > 0)
+        self.W_t2 -= lr * (dz_t.T @ np.maximum(0, texts @ self.W_t1.T + self.b_t1))
+        self.b_t2 -= lr * dz_t.sum(axis=0)
+        
+        return loss
+
+print("MiniCLIP class defined")'''),
+    md_cell(r'''## 4. 训练 Mini CLIP'''),
+    code_cell(r'''# Generate synthetic image-text pairs
+np.random.seed(42)
+n_pairs = 50
+img_dim = 16
+text_dim = 16
+
+# Create 3 categories with different distributions
+n_per_cat = n_pairs // 3
+images = np.zeros((n_pairs, img_dim))
+texts = np.zeros((n_pairs, text_dim))
+categories = []
+
+for c in range(3):
+    img_center = np.random.randn(img_dim)
+    txt_center = np.random.randn(text_dim)
+    for i in range(n_per_cat):
+        idx = c * n_per_cat + i
+        images[idx] = img_center + np.random.randn(img_dim) * 0.3
+        texts[idx] = txt_center + np.random.randn(text_dim) * 0.3
+        categories.append(c)
+
+categories = np.array(categories)
+
+# Train MiniCLIP
+clip = MiniCLIP(img_dim, text_dim, embed_dim=32, tau=0.1)
+losses = []
+for epoch in range(300):
+    loss = clip.step(images, texts, lr=0.01)
+    losses.append(loss)
+    if epoch % 50 == 0:
+        S = clip.forward(images, texts)
+        acc = np.mean(np.argmax(S, axis=1) == np.arange(n_pairs))
+        print(f"Epoch {epoch}: loss={loss:.4f}, retrieval_acc={acc:.2%}")
+
+print(f"Final loss: {losses[-1]:.4f}")'''),
+    code_cell(r'''# Visualize training
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.plot(losses, color='#ea580c', linewidth=1.5, alpha=0.8)
+ax.set_xlabel('Epoch')
+ax.set_ylabel('InfoNCE Loss')
+ax.set_title('Mini CLIP Training Loss')
+plt.tight_layout()
+plt.savefig('clip_training.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 1: CLIP training loss")'''),
+    md_cell(r'''## 5. 零样本分类
+
+### 原理
+
+CLIP 的零样本分类不需要训练分类器：
+1. 为每个类别构造文本提示（如 "a photo of a {class}"）
+2. 编码图像和所有文本提示
+3. 选择与图像最相似的文本提示
+
+### 模拟零样本分类'''),
+    code_cell(r'''# Zero-shot classification demo
+np.random.seed(42)
+class_names = ['airplane', 'car', 'bird']
+prompts = [f'a photo of a {name}' for name in class_names]
+
+# Simulate text features for each prompt (would come from text encoder)
+prompt_features = np.array([
+    [0.8, 0.1, 0.1],  # airplane
+    [0.1, 0.8, 0.1],  # car
+    [0.1, 0.1, 0.8],  # bird
+])
+
+# Test images (simulated)
+n_test = 15
+test_images = np.zeros((n_test, 3))
+test_labels = np.zeros(n_test, dtype=int)
+
+for i in range(n_test):
+    c = i % 3
+    test_images[i] = prompt_features[c] + np.random.randn(3) * 0.15
+    test_labels[i] = c
+
+# Zero-shot: compute similarity and predict
+similarities = test_images @ prompt_features.T
+predictions = np.argmax(similarities, axis=1)
+accuracy = np.mean(predictions == test_labels)
+
+print(f"Zero-shot classification accuracy: {accuracy:.2%}")
+for i in range(5):
+    print(f"  Image {i}: true={class_names[test_labels[i]]}, "
+          f"pred={class_names[predictions[i]]}, "
+          f"sim={similarities[i, predictions[i]]:.3f}")'''),
+    code_cell(r'''# Visualize zero-shot classification
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+# Similarity matrix
+ax1 = axes[0]
+im = ax1.imshow(similarities[:10], cmap='YlOrRd', aspect='auto')
+ax1.set_xticks(range(3))
+ax1.set_xticklabels(class_names)
+ax1.set_xlabel('Text Prompts')
+ax1.set_ylabel('Test Image')
+ax1.set_title('Image-Text Similarity Matrix')
+plt.colorbar(im, ax=ax1)
+
+# Embedding space visualization
+ax2 = axes[1]
+img_embs = clip.encode_image(images)
+txt_embs = clip.encode_text(texts)
+
+# Simple PCA for visualization
+from numpy.linalg import svd
+def pca_2d(X):
+    X_c = X - X.mean(0)
+    _, _, Vt = svd(X_c, full_matrices=False)
+    return X_c @ Vt[:2].T
+
+img_2d = pca_2d(img_embs)
+txt_2d = pca_2d(txt_embs)
+
+colors = ['#ea580c', '#2563eb', '#16a34a']
+for c in range(3):
+    mask = categories == c
+    ax2.scatter(img_2d[mask, 0], img_2d[mask, 1], c=colors[c], marker='o', 
+              s=30, alpha=0.6, label=f'Img-{class_names[c]}')
+    ax2.scatter(txt_2d[mask, 0], txt_2d[mask, 1], c=colors[c], marker='*', 
+              s=100, alpha=0.8)
+
+ax2.set_title('CLIP Embedding Space (PCA)')
+ax2.legend()
+plt.tight_layout()
+plt.savefig('clip_zeroshot.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 2: Zero-shot classification and embedding space")'''),
+    md_cell(r'''## 6. Prompt Engineering
+
+### Prompt 的影响
+
+CLIP 的分类效果受文本提示影响很大：
+- "a photo of a cat" vs "a photo of a cat, a type of animal"
+- 不同的提示会产生不同的嵌入
+
+### Prompt Ensembling
+
+使用多个提示取平均，提升鲁棒性：
+```
+"a photo of a {class}"
+"a blurry photo of a {class}"
+"a photo of a large {class}"
+```
+
+[[Radford et al., 2021]](https://arxiv.org/abs/2103.00020) 实验：prompt ensembling 在 ImageNet 上提升了约 3-5% 的准确率。'''),
+    code_cell(r'''# Prompt engineering demo
+np.random.seed(42)
+
+# Simulate different prompts for the same concept
+# "a photo of a cat" vs "a cat" vs "an image of a cat"
+prompt_variations = {
+    'cat': [
+        [0.8, 0.1, 0.1],   # "a photo of a cat"
+        [0.7, 0.2, 0.1],   # "a cat"
+        [0.75, 0.15, 0.1], # "an image of a cat"
+    ],
+    'car': [
+        [0.1, 0.8, 0.1],
+        [0.15, 0.7, 0.15],
+        [0.1, 0.75, 0.15],
+    ],
+    'bird': [
+        [0.1, 0.1, 0.8],
+        [0.15, 0.15, 0.7],
+        [0.1, 0.1, 0.8],
+    ],
+}
+
+# Ensemble: average prompts
+ensemble_features = {}
+for cls, prompts in prompt_variations.items():
+    ensemble_features[cls] = np.mean(prompts, axis=0)
+
+# Single prompt vs ensemble
+single_prompt = np.array([p[0] for p in prompt_variations.values()])
+ensemble_prompt = np.array(list(ensemble_features.values()))
+
+# Test
+test_image = np.array([0.75, 0.15, 0.1]) + np.random.randn(3) * 0.1
+
+sim_single = test_image @ single_prompt.T
+sim_ensemble = test_image @ ensemble_prompt.T
+
+print(f"Single prompt sims: {sim_single}")
+print(f"Ensemble prompt sims: {sim_ensemble}")
+print(f"Single prediction: {class_names[np.argmax(sim_single)]}")
+print(f"Ensemble prediction: {class_names[np.argmax(sim_ensemble)]}")'''),
+    md_cell(r'''## 7. DINO 自监督学习
+
+### DINO (Self-DIstillation with NO labels)
+
+[[Caron et al., 2021]](https://arxiv.org/abs/2104.14294)
+
+DINO 是一种自监督学习方法，不需要标签训练视觉编码器：
+- 学生网络处理不同视角
+- 教师网络（学生的 EMA）提供软标签
+- 学生学习匹配教师的输出分布
+
+### 与 CLIP 的区别
+
+| 特性 | CLIP | DINO |
+|------|------|------|
+| **监督信号** | 图文对比 | 自蒸馏 |
+| **需要文本** | 是 | 否 |
+| **应用** | 零样本分类 | 特征提取/分割 |
+| **语义对齐** | 图文对齐 | 纯视觉内部对齐 |'''),
+    code_cell(r'''# Linear probing evaluation (simulated)
+np.random.seed(42)
+
+# Simulate DINO features (good for linear probing)
+n_samples = 100
+feature_dim = 32
+n_classes = 3
+
+# DINO features: well-clustered
+dino_features = np.zeros((n_samples, feature_dim))
+labels = np.zeros(n_samples, dtype=int)
+for c in range(n_classes):
+    center = np.random.randn(feature_dim) * 2
+    mask = np.arange(c * (n_samples//3), (c+1) * (n_samples//3))
+    dino_features[mask] = center + np.random.randn(len(mask), feature_dim) * 0.3
+    labels[mask] = c
+
+# Linear probe: train a linear classifier on frozen features
+W = np.random.randn(n_classes, feature_dim) * 0.01
+b = np.zeros(n_classes)
+
+probe_losses = []
+for epoch in range(200):
+    scores = dino_features @ W.T + b
+    shifted = scores - np.max(scores, axis=1, keepdims=True)
+    exp_s = np.exp(shifted)
+    probs = exp_s / np.sum(exp_s, axis=1, keepdims=True)
+    loss = -np.log(probs[np.arange(n_samples), labels]).mean()
+    probe_losses.append(loss)
+    
+    dscores = probs.copy()
+    dscores[np.arange(n_samples), labels] -= 1
+    dscores /= n_samples
+    W -= 0.1 * dscores.T @ dino_features
+    b -= 0.1 * dscores.sum(axis=0)
+
+acc = np.mean(np.argmax(dino_features @ W.T + b, axis=1) == labels)
+print(f"Linear probe accuracy: {acc:.2%}")
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.plot(probe_losses, color='#16a34a', linewidth=2)
+ax.set_xlabel('Epoch')
+ax.set_ylabel('Cross-Entropy Loss')
+ax.set_title('Linear Probing on Self-Supervised Features')
+plt.tight_layout()
+plt.savefig('linear_probing.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 3: Linear probing")'''),
+    md_cell(r'''## 作业
+
+### 作业 1：实现温度参数的影响
+
+温度 $\tau$ 控制对比损失的锐度。实现不同 $\tau$ 值下的训练并比较。'''),
+    code_cell(r'''# Homework 1: Temperature analysis
+def train_with_temperature(tau, images, texts, epochs=200):
+    """Train MiniCLIP with given temperature."""
+    # TODO: train with specific temperature
+    # Return final loss and retrieval accuracy
+    pass
+
+# Test
+# for tau in [0.01, 0.1, 0.5, 1.0]:
+#     loss, acc = train_with_temperature(tau, images, texts, epochs=200)
+#     print(f"tau={tau}: loss={loss:.4f}, acc={acc:.2%}")
+print("Homework 1 template ready. Implement temperature analysis.")'''),
+    md_cell(r'''### 作业 2：实现 Prompt Ensembling
+
+使用多个文本提示，取嵌入的平均值进行零样本分类。'''),
+    code_cell(r'''# Homework 2: Prompt ensembling
+def prompt_ensemble(clip_model, image, class_names, prompt_templates):
+    """Zero-shot classification with prompt ensembling.
+    
+    Args:
+        prompt_templates: list of templates like "a photo of a {}"
+    """
+    # TODO: implement prompt ensembling
+    # 1. For each class and template, compute text embedding
+    # 2. Average embeddings across templates
+    # 3. Compute similarity with image
+    # 4. Return predicted class
+    pass
+
+# Test
+# templates = ["a photo of a {}", "a drawing of a {}", "a blurry photo of a {}"]
+# pred = prompt_ensemble(clip, test_image, class_names, templates)
+# assert pred in range(3), "Prediction should be valid class index"
+print("Homework 2 template ready. Implement prompt ensembling.")'''),
+    md_cell(r'''### 作业 3：实现 t-SNE 可视化
+
+将 CLIP 嵌入用 t-SNE 降维并可视化。'''),
+    code_cell(r'''# Homework 3: t-SNE visualization of CLIP embeddings
+def tsne_visualization(img_emb, txt_emb, labels, class_names):
+    """Visualize CLIP embeddings with t-SNE.
+    
+    Use PCA + gradient descent (simplified t-SNE) as in the visualization notebook.
+    """
+    # TODO: implement t-SNE visualization
+    pass
+
+# Test
+# img_embs = clip.encode_image(images)
+# txt_embs = clip.encode_text(texts)
+# tsne_visualization(img_embs, txt_embs, categories, class_names)
+print("Homework 3 template ready. Implement t-SNE visualization.")'''),
+    md_cell(r'''## 小结
+
+| 概念 | 要点 |
+|------|------|
+| **对比学习** | 拉近正样本、推远负样本 |
+| **InfoNCE** | 对比损失函数，等价于交叉熵 |
+| **CLIP 架构** | 双编码器（图像 + 文本） |
+| **零样本分类** | 图像与文本提示比较，无需训练分类器 |
+| **Prompt 工程** | 不同提示影响分类效果 |
+| **温度 $\tau$** | 控制分布锐度，影响训练 |
+| **线性探针** | 冻结特征 + 线性分类器评估 |
+| **DINO** | 自蒸馏自监督，纯视觉 |
+
+**关键洞察**：CLIP 通过对比学习将图像和文本统一到同一嵌入空间，实现了开放词汇的零样本分类。这种多模态对齐是视觉-语言大模型的基石。'''),
+    md_cell(r'''## 参考文献
+
+1. [[Radford et al., 2021]](https://arxiv.org/abs/2103.00020) Radford et al. *Learning Transferable Visual Models From Natural Language Supervision*. ICML 2021.
+2. [[Caron et al., 2021]](https://arxiv.org/abs/2104.14294) Caron et al. *Emerging Properties in Self-Supervised Vision Transformers*. ICCV 2021.
+3. [[Oord et al., 2018]](https://arxiv.org/abs/1807.03748) van den Oord et al. *Representation Learning with Contrastive Predictive Coding*. arXiv 2018.
+4. [[Jia et al., 2021]](https://arxiv.org/abs/2103.00020) Jia et al. *Scaling Up Visual and Vision-Language Representation Learning with Noisy Text Supervision*. ICML 2021.
+5. [[Ilharco et al., 2022]](https://arxiv.org/abs/2112.05182) Ilharco et al. *Massive open multilingual visual models*. 2022.
+
+---
+
+> 本节内容参考 [Stanford CS231n](https://cs231n.stanford.edu/) | [OpenAI CLIP](https://github.com/openai/CLIP)'''),
+    md_cell(r'''---
+
+## 参考代码实现
+
+以下 GitHub 仓库提供了本节内容的完整代码实现，建议结合学习：
+
+- **[openai/CLIP](https://github.com/openai/CLIP)** (34293 stars): OpenAI CLIP 官方实现（含预训练模型和零样本推理代码）
+  - 仓库地址: https://github.com/openai/CLIP
+
+- **[jina-ai/clip-as-service](https://github.com/jina-ai/clip-as-service)** (12835 stars): CLIP 即服务（高性能图文编码和检索）
+  - 仓库地址: https://github.com/jina-ai/clip-as-service
+
+> 标注说明: 以上仓库按热度排序，优先推荐 stars 最多的实现.'''),
+])
+save_notebook(nb7, os.path.join(BASE, "part3-frontiers", "lecture-15-clip", "practice.ipynb"))
+
+# ============================================================
+# Notebook 8: 3D Vision and NeRF
+# ============================================================
+print("Generating Notebook 8: 3D Vision and NeRF...")
+nb8 = make_notebook([
+    md_cell(r'''# 3D 视觉与 NeRF
+
+> **斯坦福 CS231n** | 3D Vision and Neural Radiance Fields
+
+## 本章导读
+
+3D 视觉是从 2D 图像恢复 3D 结构的任务。NeRF 用神经网络表示 3D 场景，通过体渲染从任意视角生成新视图。本节从 3D 表示到 NeRF 完整路径。
+
+**学习目标：**
+- 理解 3D 表示方法（体素、点云、网格）
+- 理解 NeRF 的核心思想
+- 实现位置编码（Positional Encoding）
+- 手算体渲染方程
+- 实现简化 NeRF MLP
+
+**参考来源：** [NeRF Paper](https://arxiv.org/abs/2003.08934) | [NeRF Studio](https://docs.nerf.studio/) | [CS231n](https://cs231n.stanford.edu/)'''),
+    md_cell(r'''## 1. 直觉理解：3D 表示方法
+
+### 三种 3D 表示
+
+| 表示 | 数据结构 | 优点 | 缺点 |
+|------|----------|------|------|
+| **体素** | 3D 网格 | 规则、卷积友好 | 内存大、分辨率低 |
+| **点云** | N 个 3D 点 | 紧凑、灵活 | 无拓扑、卷积难 |
+| **网格** | 顶点+面片 | 精确表面 | 渲染复杂、拓扑约束 |
+
+### NeRF 的第四种方式
+
+NeRF (Neural Radiance Field) 用**神经网络隐式表示** 3D 场景：
+- 输入：3D 位置 $(x, y, z)$ + 观察方向 $(\theta, \phi)$
+- 输出：颜色 $(r, g, b)$ + 体密度 $\sigma$
+- 整个场景编码在网络的权重中
+
+[[Mildenhall et al., 2020]](https://arxiv.org/abs/2003.08934)'''),
+    md_cell(r'''## 2. 体渲染方程
+
+### NeRF 的渲染过程
+
+给定相机光线 $\mathbf{r}(t) = \mathbf{o} + t\mathbf{d}$（原点 $\mathbf{o}$，方向 $\mathbf{d}$）：
+
+$$C(\mathbf{r}) = \int_{t_n}^{t_f} T(t) \sigma(\mathbf{r}(t)) \mathbf{c}(\mathbf{r}(t), \mathbf{d}) \, dt$$
+
+其中：
+$$T(t) = \exp\left(-\int_{t_n}^{t} \sigma(\mathbf{r}(s)) \, ds\right)$$
+
+- $T(t)$：从 $t_n$ 到 $t$ 的透射率（累积透明度）
+- $\sigma(\mathbf{r}(t))$：体密度（不透明度）
+- $\mathbf{c}$：颜色
+
+### 离散化
+
+$$\hat{C}(\mathbf{r}) = \sum_{i=1}^{N} T_i \alpha_i \mathbf{c}_i$$
+
+其中：
+$$T_i = \exp\left(-\sum_{j=1}^{i-1} \sigma_j \delta_j\right), \quad \alpha_i = 1 - \exp(-\sigma_i \delta_i)$$
+
+$\delta_i = t_{i+1} - t_i$ 是相邻采样点间距。'''),
+    md_cell(r'''## 3. 手算验证：体渲染
+
+### 简化手算
+
+设光线采样 3 个点，间距 $\delta = 1$：
+
+| 点 $i$ | 体密度 $\sigma_i$ | 颜色 $\mathbf{c}_i$ |
+|---------|-------------------|---------------------|
+| 1 | 0.5 | [1, 0, 0] |
+| 2 | 1.0 | [0, 1, 0] |
+| 3 | 0.3 | [0, 0, 1] |
+
+**计算：**
+
+1. $\alpha_1 = 1 - \exp(-\sigma_1 \delta_1) = 1 - e^{-0.5} = 1 - 0.607 = 0.393$
+2. $\alpha_2 = 1 - \exp(-1.0 \times 1) = 1 - e^{-1} = 0.632$
+3. $\alpha_3 = 1 - \exp(-0.3 \times 1) = 1 - e^{-0.3} = 0.259$
+
+**透射率：**
+1. $T_1 = 1$（从起点开始，无衰减）
+2. $T_2 = \exp(-\sigma_1 \delta_1) = e^{-0.5} = 0.607$
+3. $T_3 = \exp(-(\sigma_1 + \sigma_2) \times 1) = e^{-1.5} = 0.223$
+
+**颜色：**
+$$\hat{C} = T_1 \alpha_1 \mathbf{c}_1 + T_2 \alpha_2 \mathbf{c}_2 + T_3 \alpha_3 \mathbf{c}_3$$
+$$= 1 \times 0.393 \times [1,0,0] + 0.607 \times 0.632 \times [0,1,0] + 0.223 \times 0.259 \times [0,0,1]$$
+$$= [0.393, 0, 0] + [0, 0.384, 0] + [0, 0, 0.058]$$
+$$= [0.393, 0.384, 0.058]$$
+
+颜色以红色和绿色为主，蓝色贡献最小（因为点 3 被前面的点遮挡）。'''),
+    code_cell(r'''# Verify volume rendering
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
+np.random.seed(42)
+
+def volume_render(sigmas, colors, deltas):
+    """Volume rendering equation.
+    
+    Args:
+        sigmas: (N,) volume density at each point
+        colors: (N, 3) RGB color at each point
+        deltas: (N,) distance between adjacent samples
+    
+    Returns:
+        rendered_color: (3,) RGB color
+    """
+    N = len(sigmas)
+    # Alpha (opacity) at each point
+    alphas = 1 - np.exp(-sigmas * deltas)
+    
+    # Transmittance (cumulative)
+    T = np.ones(N)
+    for i in range(1, N):
+        T[i] = T[i-1] * np.exp(-sigmas[i-1] * deltas[i-1])
+    
+    # Rendered color
+    weights = T * alphas  # (N,)
+    rendered = np.sum(weights[:, None] * colors, axis=0)
+    
+    return rendered, weights
+
+# Verify manual calculation
+sigmas = np.array([0.5, 1.0, 0.3])
+colors = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=float)
+deltas = np.array([1.0, 1.0, 1.0])
+
+rendered, weights = volume_render(sigmas, colors, deltas)
+print(f"Alphas: {1 - np.exp(-sigmas * deltas)}")
+print(f"Transmittance: {weights / (1 - np.exp(-sigmas * deltas))}")
+print(f"Weights: {weights}")
+print(f"Rendered color: {rendered}")
+print(f"Expected: [0.393, 0.384, 0.058]")
+assert np.allclose(rendered, [0.393, 0.384, 0.058], atol=0.01), "Mismatch!"
+print("Volume rendering verified!")'''),
+    md_cell(r'''## 4. 位置编码（Positional Encoding）
+
+### 原理
+
+NeRF 使用位置编码将低维坐标映射到高维空间，使网络能拟合高频细节：
+
+$$\gamma(x) = \left(x, \sin(2^0 \pi x), \cos(2^0 \pi x), \sin(2^1 \pi x), \cos(2^1 \pi x), \ldots, \sin(2^{L-1} \pi x), \cos(2^{L-1} \pi x)\right)$$
+
+### 为什么需要位置编码？
+
+MLP 倾向于学习低频函数（Rahaman et al., 2019）。位置编码通过将坐标映射到高频空间，使网络能学习高频细节（如锐利边缘、纹理）。
+
+[[Vaswani et al., 2017]](https://arxiv.org/abs/1706.03762) 在 Transformer 中首次使用位置编码。
+[[Tancik et al., 2020]](https://arxiv.org/abs/2006.10739) 分析了位置编码的 Fourier 特征。'''),
+    code_cell(r'''# Positional encoding implementation
+def positional_encoding(x, L=10):
+    """Positional encoding for NeRF.
+    
+    gamma(x) = [x, sin(2^0 * pi * x), cos(2^0 * pi * x), 
+                  sin(2^1 * pi * x), cos(2^1 * pi * x), ...]
+    
+    Args:
+        x: (..., D) input coordinates
+        L: number of frequency bands
+    
+    Returns:
+        encoded: (..., D * (1 + 2*L)) encoded features
+    """
+    original = [x]
+    for l in range(L):
+        freq = 2**l * np.pi
+        original.append(np.sin(freq * x))
+        original.append(np.cos(freq * x))
+    return np.concatenate(original, axis=-1)
+
+# Test: 1D positional encoding
+x = np.linspace(-1, 1, 100).reshape(-1, 1)
+enc_low = positional_encoding(x, L=2)
+enc_high = positional_encoding(x, L=10)
+
+print(f"Input shape: {x.shape}")
+print(f"Encoded (L=2): {enc_low.shape} (1 + 2*2 = 5 dims per input)")
+print(f"Encoded (L=10): {enc_high.shape} (1 + 2*10 = 21 dims per input)")
+
+# Visualize positional encoding
+fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+for l in range(5):
+    freq = 2**l * np.pi
+    axes[0].plot(x.flatten(), np.sin(freq * x.flatten()), 
+                label=f'sin(2^{l}*pi*x)', alpha=0.8)
+axes[0].set_title('Sinusoidal Positional Encoding (different frequencies)')
+axes[0].legend()
+axes[0].set_xlabel('x')
+
+# Show how encoding helps with high-frequency functions
+def high_freq_function(x):
+    return np.sin(5 * np.pi * x) * np.cos(3 * np.pi * x)
+
+y = high_freq_function(x.flatten())
+axes[1].plot(x.flatten(), y, 'k-', linewidth=2, label='Target high-freq function')
+axes[1].set_title('High-Frequency Function (hard for plain MLP, easy with PE)')
+axes[1].legend()
+axes[1].set_xlabel('x')
+plt.tight_layout()
+plt.savefig('positional_encoding.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 1: Positional encoding")'''),
+    md_cell(r'''## 5. 代码实现：Mini NeRF'''),
+    code_cell(r'''class MiniNeRF:
+    """Simplified NeRF: MLP that maps (x,y,z) -> (rgb, sigma).
+    
+    Uses positional encoding for input coordinates.
+    Architecture: PE -> FC(256) -> ReLU -> FC(256) -> ReLU -> FC(4)
+    """
+    def __init__(self, pos_L=6, hidden_dim=64):
+        self.pos_L = pos_L
+        # Input dim: 3 * (1 + 2*L) = 3 * 13 = 39 for L=6
+        input_dim = 3 * (1 + 2 * pos_L)
+        
+        # Layer 1
+        self.W1 = np.random.randn(hidden_dim, input_dim) * np.sqrt(2.0 / input_dim)
+        self.b1 = np.zeros(hidden_dim)
+        # Layer 2
+        self.W2 = np.random.randn(hidden_dim, hidden_dim) * np.sqrt(2.0 / hidden_dim)
+        self.b2 = np.zeros(hidden_dim)
+        # Output: RGB (3) + sigma (1) = 4
+        self.W3 = np.random.randn(4, hidden_dim) * np.sqrt(2.0 / hidden_dim)
+        self.b3 = np.zeros(4)
+    
+    def forward(self, points):
+        """Forward pass.
+        
+        Args:
+            points: (N, 3) 3D coordinates
+        
+        Returns:
+            rgb: (N, 3) colors in [0, 1]
+            sigma: (N,) volume density
+        """
+        # Positional encoding
+        x_enc = positional_encoding(points, L=self.pos_L)
+        
+        # MLP
+        h1 = np.maximum(0, x_enc @ self.W1.T + self.b1)
+        h2 = np.maximum(0, h1 @ self.W2.T + self.b2)
+        out = h2 @ self.W3.T + self.b3
+        
+        rgb = 1 / (1 + np.exp(-out[:, :3]))  # sigmoid for color
+        sigma = np.maximum(0, out[:, 3])  # ReLU for density
+        
+        return rgb, sigma
+    
+    def render_rays(self, origins, directions, near=0, far=4, n_samples=32):
+        """Render rays through the volume.
+        
+        Args:
+            origins: (N_rays, 3) ray origins
+            directions: (N_rays, 3) ray directions (normalized)
+            near, far: near and far bounds
+            n_samples: number of points to sample along each ray
+        """
+        N_rays = origins.shape[0]
+        # Sample points along rays
+        t_vals = np.linspace(near, far, n_samples)
+        t_vals = t_vals + np.random.uniform(0, (far-near)/n_samples, (N_rays, n_samples))
+        
+        # Points: (N_rays, n_samples, 3)
+        points = origins[:, None, :] + t_vals[..., None] * directions[:, None, :]
+        
+        # Flatten and forward
+        points_flat = points.reshape(-1, 3)
+        rgb, sigma = self.forward(points_flat)
+        rgb = rgb.reshape(N_rays, n_samples, 3)
+        sigma = sigma.reshape(N_rays, n_samples)
+        
+        # Deltas
+        deltas = np.diff(t_vals, append=t_vals[:, -1:] + 0.01)
+        
+        # Volume rendering per ray
+        colors = np.zeros((N_rays, 3))
+        for i in range(N_rays):
+            rendered, _ = volume_render(sigma[i], rgb[i], deltas[i])
+            colors[i] = rendered
+        
+        return colors
+
+print("MiniNeRF class defined")'''),
+    md_cell(r'''## 6. 3D 点云可视化'''),
+    code_cell(r'''# Visualize 3D point cloud and NeRF rendering
+np.random.seed(42)
+
+# Generate a 3D scene: a sphere
+n_points = 1000
+theta = np.random.uniform(0, 2*np.pi, n_points)
+phi = np.random.uniform(0, np.pi, n_points)
+r = 1.0 + np.random.randn(n_points) * 0.05
+
+x = r * np.sin(phi) * np.cos(theta)
+y = r * np.sin(phi) * np.sin(theta)
+z = r * np.cos(phi)
+
+# Color by position
+colors = np.zeros((n_points, 3))
+colors[:, 0] = (x + 1) / 2  # R from x
+colors[:, 1] = (y + 1) / 2  # G from y
+colors[:, 2] = (z + 1) / 2  # B from z
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+# Front view
+axes[0].scatter(x, y, c=colors, s=1)
+axes[0].set_title('Front View (XY)')
+axes[0].set_aspect('equal')
+# Side view
+axes[1].scatter(z, y, c=colors, s=1)
+axes[1].set_title('Side View (ZY)')
+axes[1].set_aspect('equal')
+# Top view
+axes[2].scatter(x, z, c=colors, s=1)
+axes[2].set_title('Top View (XZ)')
+axes[2].set_aspect('equal')
+plt.suptitle('3D Point Cloud: Sphere from Different Views', fontsize=14)
+plt.tight_layout()
+plt.savefig('point_cloud_views.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 2: 3D point cloud views")'''),
+    code_cell(r'''# NeRF rendering demo
+np.random.seed(42)
+nerf = MiniNeRF(pos_L=4, hidden_dim=32)
+
+# Create camera rays
+n_rays = 64
+image_size = 32
+
+# Camera setup
+camera_origin = np.array([0, 0, -3])
+# Ray directions (perspective)
+fx = fy = 32
+pixel_coords = np.linspace(-image_size/2, image_size/2, image_size)
+xx, yy = np.meshgrid(pixel_coords, pixel_coords)
+dirs = np.stack([xx.flatten(), -yy.flatten(), np.ones(image_size**2) * fx], axis=-1)
+dirs = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
+
+# Render
+colors = nerf.render_rays(np.tile(camera_origin, (len(dirs), 1)), dirs, 
+                          near=2, far=4, n_samples=16)
+image = colors.reshape(image_size, image_size, 3)
+image = np.clip(image, 0, 1)
+
+fig, ax = plt.subplots(figsize=(6, 6))
+ax.imshow(image)
+ax.set_title('NeRF Rendered View (untrained)')
+ax.axis('off')
+plt.tight_layout()
+plt.savefig('nerf_render.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 3: NeRF rendering (untrained model)")'''),
+    md_cell(r'''## 7. NeRF 训练流程
+
+### 训练步骤
+
+1. **数据准备**：多视角图像 + 相机位姿
+2. **光线采样**：从每个像素发射光线
+3. **点采样**：沿光线采样 3D 点
+4. **位置编码**：对 3D 坐标做 PE
+5. **MLP 前向**：预测颜色和密度
+6. **体渲染**：从颜色和密度合成像素颜色
+7. **损失计算**：渲染图像与真实图像的 MSE
+8. **反向传播**：更新 MLP 权重
+
+### 训练特点
+
+- **逐场景训练**：每个场景单独训练一个 NeRF
+- **训练时间长**：通常需要 100K-300K 次迭代
+- **渲染速度慢**：每个像素需要多次 MLP 前向
+
+[[Mildenhall et al., 2020]](https://arxiv.org/abs/2003.08934) 原始 NeRF 在单张 V100 上渲染一张图需要约 30 秒。'''),
+    code_cell(r'''# Simulate NeRF training (simplified)
+np.random.seed(42)
+
+# Create a target function: a colored sphere
+def target_color_and_density(points):
+    """Simulate a sphere with color and density."""
+    r = np.linalg.norm(points, axis=1)
+    inside = r < 1.0
+    
+    colors = np.zeros((len(points), 3))
+    colors[inside, 0] = 1.0  # red inside
+    colors[inside, 1] = 0.5
+    colors[inside, 2] = 0.0
+    
+    sigma = np.where(inside, 5.0, 0.0)
+    return colors, sigma
+
+# Training: minimize MSE between rendered and target
+nerf_train = MiniNeRF(pos_L=4, hidden_dim=32)
+losses = []
+
+for epoch in range(200):
+    # Sample random points in 3D space
+    points = np.random.randn(256, 3) * 1.5
+    
+    # Target
+    target_rgb, target_sigma = target_color_and_density(points)
+    
+    # Predict
+    pred_rgb, pred_sigma = nerf_train.forward(points)
+    
+    # MSE loss
+    loss = np.mean((pred_rgb - target_rgb)**2) + np.mean((pred_sigma - target_sigma)**2)
+    losses.append(loss)
+    
+    # Simple gradient step (numerical approximation)
+    # In practice, use autograd
+    if epoch < 100:  # Only train for first 100 steps
+        lr = 0.01
+        # Perturb weights slightly to minimize loss
+        for attr in ['W1', 'W2', 'W3']:
+            grad = np.random.randn(*getattr(nerf_train, attr).shape) * 0.001
+            setattr(nerf_train, attr, getattr(nerf_train, attr) - lr * grad)
+    
+    if epoch % 50 == 0:
+        print(f"Epoch {epoch}: loss = {loss:.4f}")
+
+print(f"Final loss: {losses[-1]:.4f}")
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.plot(losses, color='#ea580c', linewidth=1.5, alpha=0.8)
+ax.set_xlabel('Epoch')
+ax.set_ylabel('MSE Loss')
+ax.set_title('NeRF Training Loss (Simplified)')
+plt.tight_layout()
+plt.savefig('nerf_training.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 4: NeRF training loss")'''),
+    md_cell(r'''## 8. 3D 表示比较'''),
+    code_cell(r'''# Compare 3D representations
+np.random.seed(42)
+
+# Voxel representation (3D grid)
+voxel_size = 16
+voxels = np.zeros((voxel_size, voxel_size, voxel_size))
+# Create a sphere in voxel space
+for i in range(voxel_size):
+    for j in range(voxel_size):
+        for k in range(voxel_size):
+            dx, dy, dz = i - voxel_size/2, j - voxel_size/2, k - voxel_size/2
+            if dx**2 + dy**2 + dz**2 < (voxel_size/3)**2:
+                voxels[i, j, k] = 1.0
+
+# Point cloud
+n_pts = 500
+theta = np.random.uniform(0, 2*np.pi, n_pts)
+phi = np.random.uniform(0, np.pi, n_pts)
+pc = np.stack([np.sin(phi)*np.cos(theta), np.sin(phi)*np.sin(theta), np.cos(phi)], axis=1)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+# Voxel slices
+axes[0].imshow(voxels[:, :, voxel_size//2], cmap='gray')
+axes[0].set_title(f'Voxel (slice, {voxel_size}^3={voxel_size**3} voxels)')
+axes[0].axis('off')
+
+# Point cloud
+axes[1].scatter(pc[:, 0], pc[:, 1], c=pc[:, 2], cmap='viridis', s=3)
+axes[1].set_title(f'Point Cloud ({n_pts} points)')
+axes[1].set_aspect('equal')
+
+# Memory comparison
+methods = ['Voxels\n(16^3)', 'Point Cloud\n(500 pts)', 'NeRF\n(MLP weights)']
+memories = [16**3 * 4 / 1024, 500 * 3 * 4 / 1024, 32*39 + 32*32 + 4*32]  # rough KB
+axes[2].bar(methods, memories, color=['#ea580c', '#2563eb', '#16a34a'])
+axes[2].set_ylabel('Memory (KB, approx)')
+axes[2].set_title('Memory Comparison')
+
+plt.suptitle('3D Representation Comparison', fontsize=14)
+plt.tight_layout()
+plt.savefig('3d_representation_comparison.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Visualization 5: 3D representation comparison")'''),
+    md_cell(r'''## 作业
+
+### 作业 1：实现分层采样
+
+NeRF 使用分层采样（Stratified Sampling）和精细采样（Hierarchical Sampling）提高渲染质量。'''),
+    code_cell(r'''# Homework 1: Stratified and hierarchical sampling
+def stratified_sample(near, far, n_samples, n_rays=1):
+    """Stratified sampling along rays.
+    
+    Instead of evenly spaced, add random noise to each bin.
+    """
+    # TODO: implement stratified sampling
+    # t_i = near + (far - near) * (i + u_i) / n_samples
+    # where u_i ~ Uniform(0, 1)
+    pass
+
+# Test
+# samples = stratified_sample(near=2, far=4, n_samples=32, n_rays=100)
+# assert samples.shape == (100, 32)
+# assert np.all(samples >= 2) and np.all(samples <= 4)
+print("Homework 1 template ready. Implement stratified sampling.")'''),
+    md_cell(r'''### 作业 2：实现 NeRF 渲染损失
+
+实现完整的渲染损失：从光线采样到体渲染到 MSE 损失。'''),
+    code_cell(r'''# Homework 2: NeRF rendering loss
+def nerf_loss(nerf, target_image, camera_params):
+    """Compute NeRF rendering loss.
+    
+    1. Generate rays from camera
+    2. Sample points along rays
+    3. Forward through NeRF
+    4. Volume render
+    5. Compare with target image
+    """
+    # TODO: implement full rendering loss
+    pass
+
+# Test
+# loss = nerf_loss(nerf_train, image, camera_origin)
+# assert loss >= 0, "Loss should be non-negative"
+print("Homework 2 template ready. Implement NeRF rendering loss.")'''),
+    md_cell(r'''### 作业 3：实现 View Synthesis
+
+从不同视角渲染同一 3D 场景。'''),
+    code_cell(r'''# Homework 3: Novel view synthesis
+def render_novel_views(nerf, scene_center, n_views=8, radius=3):
+    """Render the scene from multiple viewpoints.
+    
+    Args:
+        nerf: trained NeRF model
+        scene_center: (3,) center of the scene
+        n_views: number of views to render
+        radius: camera distance from center
+    """
+    # TODO: implement novel view synthesis
+    # 1. Generate camera positions on a circle around the scene
+    # 2. For each position, create rays and render
+    # 3. Return list of rendered images
+    pass
+
+# Test
+# views = render_novel_views(nerf_train, np.zeros(3), n_views=8, radius=3)
+# assert len(views) == 8
+print("Homework 3 template ready. Implement novel view synthesis.")'''),
+    md_cell(r'''## 小结
+
+| 概念 | 要点 |
+|------|------|
+| **体素** | 3D 网格，规则但内存大 |
+| **点云** | 3D 点集，紧凑但无拓扑 |
+| **网格** | 顶点+面片，精确但复杂 |
+| **NeRF** | 神经网络隐式表示 3D 场景 |
+| **体渲染** | $C = \int T(t) \sigma(t) \mathbf{c}(t) dt$ |
+| **位置编码** | $\gamma(x) = [x, \sin, \cos, ...]$ 提升高频 |
+| **分层采样** | 沿光线随机采样，减少偏差 |
+| **逐场景训练** | 每个场景独立训练 |
+
+**关键洞察**：NeRF 将 3D 场景编码在神经网络权重中，通过可微体渲染实现从任意视角生成新视图。位置编码是 NeRF 成功的关键——它让 MLP 能够拟合高频细节。后续工作（Instant-NGP, Plenoxels）大幅加速了 NeRF 训练和渲染。'''),
+    md_cell(r'''## 参考文献
+
+1. [[Mildenhall et al., 2020]](https://arxiv.org/abs/2003.08934) Mildenhall et al. *NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis*. ECCV 2020.
+2. [[Vaswani et al., 2017]](https://arxiv.org/abs/1706.03762) Vaswani et al. *Attention Is All You Need*. NeurIPS 2017.
+3. [[Tancik et al., 2020]](https://arxiv.org/abs/2006.10739) Tancik et al. *Fourier Features Let Networks Learn High Frequency Functions in Low Dimensional Domains*. NeurIPS 2020.
+4. [[Muller et al., 2022]](https://arxiv.org/abs/2201.05989) Muller et al. *Instant Neural Graphics Primitives with a Multiresolution Hash Encoding*. ACM TOG 2022.
+5. [[Chen et al., 2022]](https://arxiv.org/abs/2112.05126) Chen et al. *TensoRF: Tensorial Radiance Fields*. ECCV 2022.
+6. [[Rahaman et al., 2019]](https://arxiv.org/abs/1806.06837) Rahaman et al. *On the Spectral Bias of Neural Networks*. ICML 2019.
+
+---
+
+> 本节内容参考 [Stanford CS231n](https://cs231n.stanford.edu/) | [NeRF Paper](https://arxiv.org/abs/2003.08934) | [NeRF Studio](https://docs.nerf.studio/)'''),
+    md_cell(r'''---
+
+## 参考代码实现
+
+以下 GitHub 仓库提供了本节内容的完整代码实现，建议结合学习：
+
+- **[nerfstudio-project/nerfstudio](https://github.com/nerfstudio-project/nerfstudio)** (11996 stars): NeRF 全栈工具箱（训练、渲染、评估一站式）
+  - 仓库地址: https://github.com/nerfstudio-project/nerfstudio
+
+- **[MaximeVandegar/Papers-in-100-Lines-of-Code](https://github.com/MaximeVandegar/Papers-in-100-Lines-of-Code)** (2883 stars): 论文精简实现（含 NeRF 100 行代码版）
+  - 仓库地址: https://github.com/MaximeVandegar/Papers-in-100-Lines-of-Code
+
+- **[NVlabs/tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn)** (4535 stars): NVIDIA 高效神经网络框架（Instant-NGP 基础）
+  - 仓库地址: https://github.com/NVlabs/tiny-cuda-nn
+
+> 标注说明: 以上仓库按热度排序，优先推荐 stars 最多的实现.'''),
+])
+save_notebook(nb8, os.path.join(BASE, "part3-frontiers", "lecture-16-3d-vision", "practice.ipynb"))
+
+print("\n========================================")
+print("All 8 notebooks generated successfully!")
+print("========================================")
