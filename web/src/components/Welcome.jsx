@@ -204,7 +204,7 @@ export default function Welcome({ onSelect }) {
             <BookOpen className="w-5 h-5 sm:w-6 sm:h-6 stroke-[1.5]" />
           </div>
           <div className="space-y-0.5 min-w-0">
-            <div className="text-lg sm:text-xl md:text-2xl font-bold text-slate-900 tracking-tight leading-none">10</div>
+            <div className="text-lg sm:text-xl md:text-2xl font-bold text-slate-900 tracking-tight leading-none">{RUNNABLE_NOTEBOOKS.length}</div>
             <div className="text-[10px] sm:text-[11px] font-medium text-slate-500 leading-snug break-words">可运行 Notebook</div>
           </div>
         </div>
@@ -213,8 +213,8 @@ export default function Welcome({ onSelect }) {
             <Layers className="w-5 h-5 sm:w-6 sm:h-6 stroke-[1.5]" />
           </div>
           <div className="space-y-0.5 min-w-0">
-            <div className="text-lg sm:text-xl md:text-2xl font-bold text-slate-900 tracking-tight leading-none">3</div>
-            <div className="text-[10px] sm:text-[11px] font-medium text-slate-500 leading-snug break-words">大学习路径</div>
+            <div className="text-lg sm:text-xl md:text-2xl font-bold text-slate-900 tracking-tight leading-none">{PATH_STEPS.length}</div>
+            <div className="text-[10px] sm:text-[11px] font-medium text-slate-500 leading-snug break-words">大学学习路径</div>
           </div>
         </div>
         <div className="p-4 sm:p-5 md:p-6 flex items-center gap-3 sm:gap-4 hover:bg-slate-50/45 transition-colors">
@@ -311,7 +311,7 @@ export default function Welcome({ onSelect }) {
         <div className="flex items-center justify-between">
           <div className="space-y-0.5">
             <h2 className="text-[18px] md:text-[20px] font-bold text-slate-900">精选 Notebook</h2>
-            <p className="text-xs text-slate-500 font-medium">10 个核心章节，点击即可开始学习</p>
+            <p className="text-xs text-slate-500 font-medium">{RUNNABLE_NOTEBOOKS.length} 个核心章节，点击即可开始学习</p>
           </div>
         </div>
 

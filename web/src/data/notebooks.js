@@ -727,6 +727,7 @@ export function getCatalog() {
       title: entry.title,
       part,
       partDir: entry.partDir,
+      dir: entry.dir,
       chapterOrder: entry.chapterOrder,
     }
   })

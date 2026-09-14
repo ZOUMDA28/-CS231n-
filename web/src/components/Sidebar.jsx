@@ -14,10 +14,11 @@ import {
 import { useSettingsContext } from '../context/SettingsContext.jsx'
 import { GITHUB_REPO_URL } from '../config.js'
 
-const SECTION_KEYS = ['image-processing', 'optimization-3d']
+const SECTION_KEYS = ['deep-learning-basics', 'cnn-vision', 'frontiers']
 const SECTION_LABELS = {
-  'image-processing': '图像处理基础',
-  'optimization-3d': '最优化与立体视觉',
+  'deep-learning-basics': '深度学习基础',
+  'cnn-vision': 'CNN 与视觉',
+  frontiers: '前沿主题',
 }
 
 function getSectionKey(partDir) {
@@ -26,6 +27,8 @@ function getSectionKey(partDir) {
 
 function getLessonNumber(id) {
   const str = String(id || '')
+  const lecture = str.match(/^lecture-(\d+)([a-z])?/i)
+  if (lecture) return `${lecture[1]}${lecture[2]?.toUpperCase() || ''}`
   const sublesson = str.match(/^(\d+)([a-z])(?=-)/i)
   if (sublesson) return `${sublesson[1]}${sublesson[2].toUpperCase()}`
   const digits = str.match(/^\d+/)?.[0]
@@ -43,22 +46,16 @@ function buildSidebarSections(catalog) {
         lessons: [],
       })
     }
-    const chapterOrder = item.chapterOrder ?? 0
-    const isExtra = isExtraNotebookId(item.id)
     sections.get(section).lessons.push({
       id: item.id,
-      num: isExtra ? `${chapterOrder}+` : String(chapterOrder),
+      num: getLessonNumber(item.dir || item.id) || String(item.chapterOrder ?? ''),
       title: item.title,
       section,
     })
   }
-  return SECTION_KEYS
+  return [...new Set([...SECTION_KEYS, ...sections.keys()])]
     .map(section => sections.get(section))
     .filter(Boolean)
-}
-
-function isExtraNotebookId(id) {
-  return /_extra$/.test(id)
 }
 
 const EXPAND_FOOTER_LESSONS_WITH_FULL = 9
@@ -94,10 +91,8 @@ export default function Sidebar({
     const handler = (e) => {
       const section = e.detail?.section
       if (!section || !listRef.current) return
-      const idx = SECTION_KEYS.indexOf(section)
-      if (idx < 0) return
-      const sectionEls = listRef.current.querySelectorAll('[data-section-key]')
-      const target = sectionEls[idx]
+      const target = [...listRef.current.querySelectorAll('[data-section-key]')]
+        .find((element) => element.dataset.sectionKey === section)
       if (target) {
         target.scrollIntoView({ behavior: 'smooth', block: 'center' })
         target.classList.remove('sidebar-section-highlight')
