@@ -13,8 +13,13 @@ import {
 } from 'lucide-react'
 import { useSettingsContext } from '../context/SettingsContext.jsx'
 import { GITHUB_REPO_URL } from '../config.js'
+import { RUNNABLE_NOTEBOOKS } from '../data/sidebar.js'
 
 const SECTION_KEYS = ['deep-learning-basics', 'cnn-vision', 'frontiers']
+const LESSON_TITLES = new Map(
+  RUNNABLE_NOTEBOOKS.map(({ lessonId, title }) => [lessonId, title]),
+)
+
 const SECTION_LABELS = {
   'deep-learning-basics': '深度学习基础',
   'cnn-vision': 'CNN 与视觉',
@@ -49,7 +54,7 @@ function buildSidebarSections(catalog) {
     sections.get(section).lessons.push({
       id: item.id,
       num: getLessonNumber(item.dir || item.id) || String(item.chapterOrder ?? ''),
-      title: item.title,
+      title: LESSON_TITLES.get(item.id) || item.title,
       section,
     })
   }
